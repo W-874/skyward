@@ -224,6 +224,156 @@ mod tests {
         Bench { _dir: dir, dir: path, state: state_path, store: device, program }
     }
 
+    // Based on the user's existing (uncommitted) dada_stock_pair_survives_interrupted_switch_on_files
+    // in SkyWard. Keep the synthetic round-trip tests independent of the stock fixtures.
+    #[test]
+    fn dada_stock_pair_survives_interrupted_switch_on_files() {
+        stock_pair_survives_interrupted_switch_on_files(
+            "dada/images", "OS4.0.0.22.XOCCNXM", [
+                (100663296, "7407f44c6afde05384a543c3b47bab50daa83c3e242dcbe0b4a7a6db17a89052"),
+                (8388608, "65d39f7af0b3a9f6989e08b5dafcedcd393143b8db202a19e6e902c04b8af56c"),
+            ],
+        );
+    }
+
+    #[test]
+    fn fuxi_stock_pair_survives_interrupted_switch_on_files() {
+        stock_pair_survives_interrupted_switch_on_files(
+            "fuxi/os3-packaging", "OS3.0.309.0.WMCCNXM", [
+                (100663296, "d973cf1324147d9411feea07ab070aec11fb2ec2c1bb5ef7a512b42bd44c8859"),
+                (8388608, "236072ac4c1c8f21506c59c1717dc232972912e538fdd82ee4c76c53f86ba10e"),
+            ],
+        );
+    }
+
+    fn stock_pair_survives_interrupted_switch_on_files(fixture: &str, version: &str, pinned: [(usize, &str); 2]) {
+        use sha2::{Digest, Sha256};
+
+        let root = std::env::var_os("SKYWARD_STOCK_BASELINE").map(PathBuf::from)
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../host-baseline"));
+        let stock = root.join(fixture);
+        let read = |part: &str, (len, sha): (usize, &str)| {
+            let path = stock.join(format!("{part}.img"));
+            let image = fs::read(&path).unwrap_or_else(|e| panic!("BLOCKED: {version}: {}: {e}", path.display()));
+            assert_eq!(len, image.len(), "wrong {part} size for {version}");
+            assert_eq!(sha, hex::encode(Sha256::digest(&image)), "wrong {part} bytes for {version}");
+            image
+        };
+        let [stock_boot, stock_init] = [read("boot", pinned[0]), read("init_boot", pinned[1])];
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Cut {
+            Begun, SavingBoot, SavedBoot, SavingInit, SavedPair, SaveRecorded,
+            WritingBoot, WroteBoot, WritingInit, WrotePair, Committed,
+        }
+        use Cut::*;
+
+        let mut guest_boot = vec![0; stock_boot.len()];
+        guest_boot[..8192].fill(0x5a);
+        // A Skyward-shaped guest with an older program, as in the original local test.
+        let guest_template = crate::boot::init_boot(&stock_init, b"test program", &start()).unwrap();
+        for (to, cuts) in [
+            (Who::Other, &[Begun, SavingBoot, SavedBoot, SavingInit, SavedPair, SaveRecorded, WritingBoot, WroteBoot, WritingInit, WrotePair, Committed][..]),
+            (Who::Installed, &[Begun, WritingBoot, WroteBoot, WritingInit, WrotePair, Committed][..]),
+        ] {
+            for &cut in cuts {
+                let b = installed();
+                let mut s = State::load(&b.state).unwrap();
+                let mut store = s.store.take().unwrap();
+                fs::write(b.dir.join("boot_a"), &stock_boot).unwrap();
+                fs::write(b.dir.join("init_boot_a"), &stock_init).unwrap();
+                store.boot = stock_boot.len() as u64;
+                store.init_boot = stock_init.len() as u64;
+                store.area.size = crate::state::Store::size_for(store.boot, store.init_boot);
+                fs::File::create(&b.store).unwrap().set_len(store.area.size).unwrap();
+                s.system.as_mut().unwrap().set = put(&store, &b.store, OTHER, &mut &guest_boot[..8192], 8192, &guest_template).unwrap();
+                // Keep a previous complete save while the next one is interrupted.
+                let old_save = store::save(&store, &b.store, 0, &b.dir, Slot::A).unwrap();
+                s.saved = Some(old_save.clone());
+                s.store = Some(store.clone());
+                s.save(&b.state).unwrap();
+                let places = b.places();
+                let prefix = |path: &Path, offset: u64, bytes: &[u8]| {
+                    use std::io::{Seek, SeekFrom, Write};
+                    let mut file = fs::OpenOptions::new().write(true).open(path).unwrap();
+                    file.seek(SeekFrom::Start(offset)).unwrap();
+                    file.write_all(bytes).unwrap();
+                    file.sync_all().unwrap();
+                };
+                let mut guest_init = other_init_boot(&places, &s).unwrap();
+                guest_init.resize(stock_init.len(), 0);
+                if to == Who::Installed {
+                    switch(&places, Slot::A, Who::Other).unwrap();
+                    s = State::load(&b.state).unwrap();
+                }
+                let target = if to == Who::Other { (&guest_boot, &guest_init) } else { (&stock_boot, &stock_init) };
+                if cut == Committed {
+                    switch(&places, Slot::A, to).unwrap();
+                } else {
+                    // Materialize the exact on-disk prefix of finish(); resume must reload it from files.
+                    s.switching = Some(Switching { to, slot: "_a".into(), saved: false });
+                    s.save(&b.state).unwrap();
+                    if to == Who::Other {
+                        match cut {
+                            SavingBoot | SavedBoot | SavingInit => {
+                                let offset = skyward_block::area::HEADER + store.boot + store.init_boot;
+                                prefix(&b.store, offset, if cut == SavingBoot { &stock_boot[..4096] } else { &stock_boot });
+                                if cut == SavingInit {
+                                    prefix(&b.store, offset + store.boot, &stock_init[..4096]);
+                                }
+                            }
+                            SavedPair | SaveRecorded | WritingBoot | WroteBoot | WritingInit | WrotePair => {
+                                let saved = store::save(&store, &b.store, 1, &b.dir, Slot::A).unwrap();
+                                if cut != SavedPair {
+                                    s.saved = Some(saved);
+                                    s.switching.as_mut().unwrap().saved = true;
+                                    s.save(&b.state).unwrap();
+                                }
+                            }
+                            Begun | Committed => {}
+                        }
+                    }
+                    match cut {
+                        WritingBoot => prefix(&b.dir.join("boot_a"), 0, &target.0[..4096]),
+                        WroteBoot | WritingInit => {
+                            prefix(&b.dir.join("boot_a"), 0, target.0);
+                            if cut == WritingInit {
+                                prefix(&b.dir.join("init_boot_a"), 0, &target.1[..4096]);
+                            }
+                        }
+                        WrotePair => {
+                            let set = if to == Who::Other { &s.system.as_ref().unwrap().set } else { s.saved.as_ref().unwrap() };
+                            store::restore(&store, &b.store, set, &b.dir, Slot::A, (to == Who::Other).then_some(guest_init.as_slice())).unwrap();
+                        }
+                        _ => {}
+                    }
+                }
+                let case = format!("{fixture} {version}, {to:?} at {cut:?}");
+                assert_eq!(resume(&places).unwrap_or_else(|e| panic!("{case}: {e:#}")), cut != Committed, "{case}");
+                assert!(!resume(&places).unwrap(), "{case}: resume is not idempotent");
+                let finished = State::load(&b.state).unwrap();
+                let saved = finished.saved.unwrap();
+                assert_eq!((saved.entry, &saved.boot, &saved.init_boot), (1, &old_save.boot, &old_save.init_boot), "{case}: wrong save after resume");
+                store::check(&store, &b.store, &old_save).unwrap();
+                if to == Who::Other {
+                    assert_eq!(finished.occupied.as_deref(), Some("_a"), "{case}");
+                    assert!(b.read("boot_a") == guest_boot, "{case}: guest boot differs");
+                    assert!(b.read("init_boot_a") == guest_init, "{case}: guest init_boot differs");
+                    assert_eq!(b.program_in("init_boot_a"), b"new program", "{case}");
+                    switch(&places, Slot::B, Who::Installed).unwrap();
+                }
+                let restored = State::load(&b.state).unwrap();
+                assert_eq!((restored.occupied, restored.written, restored.switching), (None, None, None), "{case}");
+                assert!(b.read("boot_a") == stock_boot, "{case}: stock boot not restored byte for byte");
+                assert!(b.read("init_boot_a") == stock_init, "{case}: stock init_boot not restored byte for byte");
+                assert_eq!(b.read("boot_b"), vec![0xb1; 8192], "{case}: the other boot slot was written");
+                assert_eq!(b.read("init_boot_b"), vec![0xb2; 16384], "{case}: the other init_boot slot was written");
+                assert!(!resume(&places).unwrap(), "{case}: a switch was left pending");
+                println!("{case}: restored both stock images byte for byte");
+            }
+        }
+    }
+
     #[test]
     fn switching_there_and_back_puts_each_systems_boot_set_in_place() {
         let b = installed();
