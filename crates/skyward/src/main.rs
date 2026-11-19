@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
-use skyward_config::{ramdisk, DeviceConfig};
+#[cfg(target_os = "android")]
+use skyward_config::ramdisk;
+use skyward_config::DeviceConfig;
 #[cfg(target_os = "android")]
 use skyward_programs::secure::Started;
 use skyward_sys::{bcb, Power};
