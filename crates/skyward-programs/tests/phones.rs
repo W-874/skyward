@@ -56,6 +56,23 @@ fn strings(words: &[&str]) -> Vec<String> {
     words.iter().map(|w| w.to_string()).collect()
 }
 
+#[test]
+fn fuxi_skips_absent_touch_programs_and_discovers_its_key_services_once() {
+    let cfg = skyward_config::DeviceConfig::parse(include_str!("../../../devices/fuxi.toml")).unwrap();
+    let properties = [("ro.boot.hardware", "qcom"), ("ro.boot.product.vendor.sku", "kalama"), ("ro.boot.product.hardware.sku", "fuxi")];
+    let phone = phone("fuxi", &properties);
+    for path in ["/odm/bin/touch_report", "/odm/bin/touchsensor"] {
+        let declared = phone.programs.iter().find(|p| p.path == path).expect("declared by the stock touchfeature script");
+        assert_eq!(phone.runs(declared), Happens::No, "{path}");
+        assert!(!cfg.services.iter().any(|s| s.path == path), "do not start absent {path}");
+    }
+    let steps = secure::steps(&phone).unwrap();
+    assert_eq!(names(&steps), ["qseecomd", "ssgtzd", "android.hardware.security.keymint-service-qti", "hwservicemanager", "android.hardware.gatekeeper@1.0-service-qti", "android.hardware.boot@1.2-service"]);
+    for started in secure::programs(&steps) {
+        assert!(!cfg.services.iter().any(|s| s.path == started.service.path), "{} is already discovered", started.service.path);
+    }
+}
+
 /// The folders a program finds its libraries in, by the partition it is
 /// on.
 const ON_VENDOR: [&str; 5] = ["/system/lib64", "/vendor/lib64", "/vendor/lib64/hw", "/mnt/system/system/lib64", "/mnt/system/system/lib64/bootstrap"];
