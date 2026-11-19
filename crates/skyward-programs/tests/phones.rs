@@ -5,6 +5,7 @@
 //! started on the phone then.
 
 use skyward_config::Service;
+use skyward_programs::description::Kind::{Aidl, Hidl};
 use skyward_programs::naming::{self, Does};
 use skyward_programs::phone::{Happens, Partition, Phone, PARTITIONS};
 use skyward_programs::script::{Socket, SocketKind};
@@ -34,7 +35,10 @@ fn phone(codename: &str, properties: &[(&str, &str)]) -> Phone {
 /// That phone, with `bundle` as where a recovery has opened the libraries
 /// its partitions were built against.
 fn with_bundle(codename: &str, properties: &[(&str, &str)], bundle: Option<&Path>) -> Phone {
-    let at = described(codename);
+    read_phone(&described(codename), properties, bundle)
+}
+
+fn read_phone(at: &Path, properties: &[(&str, &str)], bundle: Option<&Path>) -> Phone {
     let partitions = PARTITIONS.iter().map(|name| Partition { name: name.to_string(), mounted: mounted(name).into(), at: at.join(name) }).collect();
     let properties: HashMap<String, String> = properties.iter().map(|(name, value)| (name.to_string(), value.to_string())).collect();
     Phone::read(partitions, properties, bundle).unwrap()
@@ -109,6 +113,68 @@ const SHARED_SECRET: &str = "android.hardware.security.sharedsecret.ISharedSecre
 const CREDENTIALS: &str = "android.hardware.gatekeeper.IGatekeeper/default";
 const WEAVER: &str = "android.hardware.weaver.IWeaver/default";
 const BOOT: &str = "android.hardware.boot.IBootControl/default";
+
+/// Resolve the defaults in the stock VINTF/rc files, not by assuming all
+/// builds use the AIDL names. The fixture's bin entries record file presence.
+#[test]
+fn p2_3_discovers_native_boot_keymint_and_gatekeeper() {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/p2.3");
+    let keymint = (
+        Aidl, KEYS,
+        "/vendor/etc/vintf/manifest/android.hardware.security.keymint-service-qti.xml",
+        "/vendor/etc/init/android.hardware.security.keymint-service-qti.rc",
+        "/vendor/bin/hw/android.hardware.security.keymint-service-qti",
+    );
+    for (stock, vendor_sku, hardware_sku, expected) in [
+        ("dada-os4.0.0.22", "sun", "dada", [
+            keymint,
+            (Aidl, CREDENTIALS,
+                "/vendor/etc/vintf/manifest_sun.xml",
+                "/vendor/etc/init/android.hardware.gatekeeper-service-qti.rc",
+                "/vendor/bin/hw/android.hardware.gatekeeper-service-qti"),
+            (Aidl, BOOT,
+                "/vendor/etc/vintf/manifest/boot-service.qti.xml",
+                "/vendor/etc/init/android.hardware.boot-service.qti.rc",
+                "/vendor/bin/hw/android.hardware.boot-service.qti"),
+        ]),
+        ("fuxi-os3.0.309", "kalama", "fuxi", [
+            keymint,
+            (Hidl, "android.hardware.gatekeeper@1.0::IGatekeeper/default",
+                "/vendor/etc/vintf/manifest_kalama.xml",
+                "/vendor/etc/init/android.hardware.gatekeeper@1.0-service-qti.rc",
+                "/vendor/bin/hw/android.hardware.gatekeeper@1.0-service-qti"),
+            (Hidl, "android.hardware.boot@1.2::IBootControl/default",
+                "/vendor/etc/vintf/manifest/android.hardware.boot@1.2.xml",
+                "/vendor/etc/init/android.hardware.boot@1.2-service.rc",
+                "/vendor/bin/hw/android.hardware.boot@1.2-service"),
+        ]),
+    ] {
+        let properties = [
+            ("ro.boot.hardware", "qcom"),
+            ("ro.boot.product.vendor.sku", vendor_sku),
+            ("ro.boot.product.hardware.sku", hardware_sku),
+        ];
+        let phone = read_phone(&fixtures.join(stock), &properties, None);
+        let steps = secure::steps(&phone).unwrap_or_else(|e| panic!("{stock}: {e:#}"));
+        let mut selected = steps.iter().filter_map(|step| {
+            let Step::Start(started) = step else { return None };
+            let service = &started.service;
+            let ready = match (service.ready_service.as_deref(), service.ready_hardware_service.as_deref()) {
+                (None, None) => return None,
+                (Some(aidl), None) => (Aidl, aidl),
+                (None, Some(hidl)) => (Hidl, hidl),
+                _ => panic!("{stock}: {} has both kinds of readiness", service.path),
+            };
+            Some((ready, service.path.as_str()))
+        });
+        for (kind, name, manifest, script, binary) in expected {
+            assert_eq!(selected.next(), Some(((kind, name), binary)), "{stock}: startup plan");
+            assert!(phone.services.iter().any(|s| s.file == manifest && s.described.kind == kind && s.described.name() == name), "{stock}: {name} not read from {manifest}");
+            assert!(phone.programs.iter().any(|p| p.script == script && p.path == binary), "{stock}: {binary} not read from {script}");
+        }
+        assert_eq!(selected.next(), None, "{stock}: unexpected HAL in startup plan");
+    }
+}
 
 /// The listeners of the secure world, which every phone here starts the
 /// same.
