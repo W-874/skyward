@@ -7,12 +7,20 @@
 use anyhow::{bail, Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 /// Where Android's first stage finds the vendor ramdisk's modules.
 pub const FIRST_STAGE: &str = "/lib/modules";
+
+// The last step only: a file has already been resolved and opened, and the
+// options are ready. Host tests record it rather than calling finit_module.
+type Insert<'a> = dyn FnMut(&str, &File, &str) -> std::io::Result<()> + 'a;
+
+fn insert_module(_path: &str, file: &File, options: &str) -> std::io::Result<()> {
+    crate::finit_module(file, options)
+}
 
 /// A module's name as the kernel knows it: its file's name without the
 /// folder and the `.ko`, with `-` written `_`. None for a name of fewer
@@ -130,13 +138,17 @@ impl Modprobe {
     /// Read the module files in `bases`, with `load_file` the list to load,
     /// and the settings `cmdline` gives modules.
     pub fn new(bases: &[String], load_file: &str, cmdline: &str) -> Result<Self> {
+        Self::new_at(Path::new("/"), bases, load_file, cmdline)
+    }
+
+    fn new_at(ramdisk: &Path, bases: &[String], load_file: &str, cmdline: &str) -> Result<Self> {
         let mut m = Modprobe::default();
         for base in bases {
             for args in config(&format!("{base}/modules.alias"))? {
                 m.alias(&args);
             }
             for args in config(&format!("{base}/modules.dep"))? {
-                m.dep(base, &args);
+                m.dep(ramdisk, base, &args)?;
             }
             for args in config(&format!("{base}/modules.softdep"))? {
                 m.softdep(&args);
@@ -163,17 +175,27 @@ impl Modprobe {
         }
     }
 
-    fn dep(&mut self, base: &str, args: &[String]) {
+    fn dep(&mut self, ramdisk: &Path, base: &str, args: &[String]) -> Result<()> {
         let Some((name, _)) = args[0].split_once(':') else {
-            return;
+            return Ok(());
         };
         let Some(module) = canonical(name) else {
-            return;
+            return Ok(());
         };
-        let path = |arg: &str| if arg.starts_with('/') { arg.to_string() } else { format!("{base}/{arg}") };
-        let mut files = vec![path(name)];
-        files.extend(args[1..].iter().map(|a| path(a.as_str())));
+        let path = |arg: &str| -> Result<String> {
+            if let Some(relative) = arg.strip_prefix('/') {
+                if ramdisk == Path::new("/") {
+                    Ok(arg.to_string())
+                } else {
+                    Ok(ramdisk.join(relative).to_str().context("ramdisk path is not UTF-8")?.to_string())
+                }
+            } else {
+                Ok(format!("{base}/{arg}"))
+            }
+        };
+        let files = std::iter::once(name).chain(args[1..].iter().map(String::as_str)).map(path).collect::<Result<Vec<_>>>()?;
         self.deps.insert(module, files);
+        Ok(())
     }
 
     fn softdep(&mut self, args: &[String]) {
@@ -277,6 +299,10 @@ impl Modprobe {
     /// Load `name`, and every module an alias matching it names, each with
     /// its dependencies; an error when none of them loads.
     pub fn load(&mut self, name: &str) -> Result<()> {
+        self.load_with(name, &mut insert_module)
+    }
+
+    fn load_with(&mut self, name: &str, insert: &mut Insert<'_>) -> Result<()> {
         let module = canonical(name).unwrap_or_default();
         if self.loaded.contains(&module) {
             return Ok(());
@@ -294,7 +320,7 @@ impl Modprobe {
                 why.push(reason);
                 continue;
             }
-            match self.insmod_with_deps(candidate) {
+            match self.insmod_with_deps(candidate, insert) {
                 Ok(()) => loaded = true,
                 Err(e) => why.push(format!("{e:#}")),
             }
@@ -306,32 +332,32 @@ impl Modprobe {
     }
 
     /// A soft dependency is loaded where it can be, and left out where not.
-    fn load_soft(&mut self, name: &str) {
-        let _ = self.load(name);
+    fn load_soft(&mut self, name: &str, insert: &mut Insert<'_>) {
+        let _ = self.load_with(name, insert);
     }
 
-    fn insmod_with_deps(&mut self, module: &str) -> Result<()> {
+    fn insmod_with_deps(&mut self, module: &str, insert: &mut Insert<'_>) -> Result<()> {
         let files = self.deps.get(module).cloned().with_context(|| format!("{module} is not in modules.dep"))?;
         for dep in files[1..].iter().rev() {
-            self.load(dep).with_context(|| format!("{module} depends on it"))?;
+            self.load_with(dep, insert).with_context(|| format!("{module} depends on it"))?;
         }
         let pre: Vec<String> = self.pre.iter().filter(|(m, _)| m == module).map(|(_, d)| d.clone()).collect();
         for dep in &pre {
-            self.load_soft(dep);
+            self.load_soft(dep, insert);
         }
-        self.insmod(&files[0])?;
+        self.insmod(&files[0], insert)?;
         let post: Vec<String> = self.post.iter().filter(|(m, _)| m == module).map(|(_, d)| d.clone()).collect();
         for dep in &post {
-            self.load_soft(dep);
+            self.load_soft(dep, insert);
         }
         Ok(())
     }
 
-    fn insmod(&mut self, path: &str) -> Result<()> {
+    fn insmod(&mut self, path: &str, insert: &mut Insert<'_>) -> Result<()> {
         let module = canonical(path).unwrap_or_default();
         let options = self.options.get(&module).cloned().unwrap_or_default();
         let file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path).with_context(|| format!("open {path}"))?;
-        match crate::finit_module(&file, &options) {
+        match insert(path, &file, &options) {
             Ok(()) => self.count += 1,
             Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {}
             Err(e) => return Err(e).with_context(|| format!("load {path} with {options:?}")),
@@ -346,9 +372,13 @@ impl Modprobe {
     /// Returns those not loaded that the blocklist names neither, nor a
     /// module they depend on, with why.
     pub fn load_listed(&mut self) -> Vec<(String, anyhow::Error)> {
+        self.load_listed_with(&mut insert_module)
+    }
+
+    fn load_listed_with(&mut self, insert: &mut Insert<'_>) -> Vec<(String, anyhow::Error)> {
         let mut failed = Vec::new();
         for name in self.listed.clone() {
-            if let Err(e) = self.load(&name)
+            if let Err(e) = self.load_with(&name, insert)
                 && !self.is_blocklisted(&name)
             {
                 failed.push((name, e));
@@ -419,38 +449,155 @@ fn load_file(dir: &str, charger: bool) -> &'static str {
 /// names; where one does not load, the rest still do. An error is a
 /// module file not read.
 pub fn first_stage(cmdline: &str, bootconfig: &str, skip: &[String]) -> Result<Loaded> {
-    let entries = match fs::read_dir(FIRST_STAGE) {
+    let release = fs::read_to_string("/proc/sys/kernel/osrelease").context("read the kernel's release")?;
+    let page_size = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).context("read the page size")?;
+    first_stage_from(Path::new("/"), release.trim(), page_size, cmdline, bootconfig, skip, &mut insert_module)
+}
+
+fn first_stage_from(ramdisk: &Path, release: &str, page_size: u64, cmdline: &str, bootconfig: &str, skip: &[String], insert: &mut Insert<'_>) -> Result<Loaded> {
+    let base = ramdisk.join(FIRST_STAGE.trim_start_matches('/'));
+    let base = base.to_str().context("module directory path is not UTF-8")?;
+    let entries = match fs::read_dir(base) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Loaded { dir: PathBuf::from(FIRST_STAGE), count: 0, failed: Vec::new() }),
-        Err(e) => return Err(e).with_context(|| format!("read {FIRST_STAGE}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Loaded { dir: PathBuf::from(base), count: 0, failed: Vec::new() }),
+        Err(e) => return Err(e).with_context(|| format!("read {base}")),
     };
     let mut names = Vec::new();
     for entry in entries {
-        let entry = entry.with_context(|| format!("read {FIRST_STAGE}"))?;
-        if entry.file_type().with_context(|| format!("read {FIRST_STAGE}"))?.is_dir() {
+        let entry = entry.with_context(|| format!("read {base}"))?;
+        if entry.file_type().with_context(|| format!("read {base}"))?.is_dir() {
             names.push(entry.file_name().to_string_lossy().into_owned());
         }
     }
-    let release = fs::read_to_string("/proc/sys/kernel/osrelease").context("read the kernel's release")?;
-    let page_size = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).context("read the page size")?;
     let charger = charging(cmdline, bootconfig);
-    for name in version_dirs(&names, release.trim(), page_size)? {
-        let dir = format!("{FIRST_STAGE}/{name}");
-        let mut m = Modprobe::new(std::slice::from_ref(&dir), load_file(&dir, charger), cmdline)?.skipping(skip);
-        let failed = m.load_listed();
+    for name in version_dirs(&names, release, page_size)? {
+        let dir = format!("{base}/{name}");
+        let mut m = Modprobe::new_at(ramdisk, std::slice::from_ref(&dir), load_file(&dir, charger), cmdline)?.skipping(skip);
+        let failed = m.load_listed_with(insert);
         if m.count() > 0 {
             return Ok(Loaded { dir: PathBuf::from(dir), count: m.count(), failed });
         }
     }
-    let base = FIRST_STAGE.to_string();
-    let mut m = Modprobe::new(std::slice::from_ref(&base), load_file(&base, charger), cmdline)?.skipping(skip);
-    let failed = m.load_listed();
+    let base = base.to_string();
+    let mut m = Modprobe::new_at(ramdisk, std::slice::from_ref(&base), load_file(&base, charger), cmdline)?.skipping(skip);
+    let failed = m.load_listed_with(insert);
     Ok(Loaded { dir: PathBuf::from(base), count: m.count(), failed })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dada_vendor_boot_first_stage_load_plan() {
+        stock_first_stage(
+            "dada", "dada:15/OS4.0.0.22.XOCCN:user", "6.6.118-android15-8-gb9cc6ec16bc8-abogki536571621-4k",
+            "dada/kernel/vendor_boot", "dada/kernel/ikconfig", ["boot-header.txt", "vendor_boot-header.txt"],
+        );
+    }
+
+    #[test]
+    fn fuxi_vendor_boot_first_stage_load_plan() {
+        stock_first_stage(
+            "fuxi", "fuxi:13/OS3.0.309.0.WMCCNXM:user", "5.15.194-android13-8-00019-gf4321180a397-ab15212794",
+            "fuxi/os3-packaging/headers/vendor_boot", "fuxi/os3-packaging/headers/boot/ikconfig", ["os3-boot-header.log", "os3-vendor_boot-header.log"],
+        );
+    }
+
+    fn stock_first_stage(device: &str, fingerprint: &str, release: &str, vendor_boot: &str, ikconfig: &str, [boot_header, vendor_header]: [&str; 2]) {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let baseline = std::env::var_os("SKYWARD_STOCK_BASELINE").map(PathBuf::from)
+            .unwrap_or_else(|| workspace.join("host-baseline"));
+        let headers = std::env::var_os("SKYWARD_STOCK_EVIDENCE").map(PathBuf::from)
+            .unwrap_or_else(|| workspace.join("evidence")).join(format!("{device}-baseline"));
+        let read = |path: &Path| fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("BLOCKED: {fingerprint}: {}: {e}", path.display()));
+        let config = read(&baseline.join(ikconfig));
+        let page_size = [4, 16, 64].into_iter().find(|kb| config.lines().any(|line| line == format!("CONFIG_ARM64_{kb}K_PAGES=y")))
+            .expect("stock ARM64 kernel page size from IKCONFIG") * 1024;
+        let cmdline_from = |file: &str, prefix: &str| {
+            read(&headers.join(file)).lines().find_map(|line| line.strip_prefix(prefix)).expect("command line from unpack_bootimg").trim().to_owned()
+        };
+        let boot = cmdline_from(boot_header, "command line args:");
+        let vendor = cmdline_from(vendor_header, "vendor command line args:");
+        assert!(vendor.split_ascii_whitespace().any(|arg| arg.strip_prefix("swinfo.fingerprint=") == Some(fingerprint)), "wrong vendor_boot command line for {fingerprint}");
+        let cmdline = format!("{boot} {vendor}").trim().to_owned();
+        let vendor_boot = baseline.join(vendor_boot);
+        let bootconfig = read(&vendor_boot.join("bootconfig"));
+        let ramdisk = vendor_boot.join("ramdisk");
+        let mut plan = Vec::new();
+        let mut record = |path: &str, _: &File, options: &str| {
+            assert!(Path::new(path).starts_with(&ramdisk), "module outside the stock ramdisk: {path}");
+            plan.push((canonical(path).unwrap(), options.to_string()));
+            Ok(())
+        };
+        assert!(!charging(&cmdline, &bootconfig), "expected the normal modules.load, not a charger list");
+        let loaded = first_stage_from(&ramdisk, release, page_size, &cmdline, &bootconfig, &[], &mut record).unwrap();
+        let base = loaded.dir.to_str().unwrap().to_owned();
+        let listed: Vec<_> = read(&loaded.dir.join("modules.load")).lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(|line| canonical(line.split_ascii_whitespace().next().unwrap()).unwrap()).collect();
+        assert!(!listed.is_empty(), "stock modules.load is empty");
+        assert!(!read(&loaded.dir.join("modules.dep")).is_empty(), "stock modules.dep is empty");
+        read(&loaded.dir.join("modules.softdep"));
+        let parsed = Modprobe::new_at(&ramdisk, &[base], "modules.load", &cmdline).unwrap();
+        assert_eq!(loaded.count, plan.len());
+        assert!(!plan.is_empty(), "first stage calculated an empty plan");
+        let positions: BTreeMap<&str, usize> = plan.iter().enumerate().map(|(i, (name, _))| (name.as_str(), i)).collect();
+        assert_eq!(positions.len(), plan.len(), "a module was planned twice");
+        println!("{fingerprint}: {} requests, {} loads; {}", listed.len(), loaded.count, loaded.dir.display());
+        println!("cmdline: {cmdline}\nbootconfig:\n{bootconfig}");
+        let mut pending: Vec<_> = listed.iter().map(String::as_str).filter(|m| positions.contains_key(m)).collect();
+        for (i, (name, options)) in plan.iter().enumerate() {
+            for path in &parsed.deps[name][1..] {
+                let dep = canonical(path).unwrap();
+                assert!(positions.get(dep.as_str()).is_some_and(|pos| *pos < i), "{name} requires {dep} before it");
+            }
+            println!("LOAD\t{}\t{name}\t{options}", i + 1);
+            if pending.first() != Some(&name.as_str()) {
+                let pre = parsed.pre.iter().filter(|(m, d)| canonical(d).as_ref() == Some(name) && positions.get(m.as_str()).is_some_and(|p| *p > i))
+                    .map(|(m, _)| format!("pre softdep of {m}"));
+                let post = parsed.post.iter().filter(|(m, d)| canonical(d).as_ref() == Some(name) && positions.get(m.as_str()).is_some_and(|p| *p < i))
+                    .map(|(m, _)| format!("post softdep of {m}"));
+                let hard = parsed.deps.iter().filter(|(m, paths)| positions.get(m.as_str()).is_some_and(|p| *p > i)
+                    && paths[1..].iter().any(|d| canonical(d).as_ref() == Some(name))).map(|(m, _)| format!("hard dependency of {m}"));
+                let aliases = parsed.aliases.iter().filter(|(alias, module)| module == name && listed.iter().any(|m| matches(alias, m)))
+                    .map(|(alias, _)| format!("alias {alias}"));
+                let why = hard.chain(pre).chain(post).chain(aliases).collect::<Vec<_>>().join("; ");
+                let kind = if pending.contains(&name.as_str()) { "EARLY" } else { "EXTRA" };
+                println!("{kind}\t{name}\tnext requested: {}\t{why}", pending.first().unwrap_or(&"<end>"));
+                assert!(!why.is_empty(), "unexplained plan difference for {name}");
+            }
+            pending.retain(|m| *m != name.as_str());
+        }
+        for name in &listed {
+            if !positions.contains_key(name.as_str()) {
+                assert!(parsed.is_blocklisted(name), "requested module {name} missing: {:?}", loaded.failed);
+                println!("OMITTED\t{name}\tblocklisted directly or via hard dependency");
+            }
+        }
+        assert!(loaded.failed.is_empty(), "first-stage failures: {:?}", loaded.failed);
+        for (kind, edges) in [("pre", &parsed.pre), ("post", &parsed.post)] {
+            for (m, d) in edges {
+                if positions.contains_key(m.as_str()) {
+                    let dep = canonical(d).unwrap();
+                    let outcome = positions.get(dep.as_str()).map_or_else(
+                        || parsed.absent(&dep).unwrap_or_else(|| "not loadable with its dependencies".into()),
+                        |i| format!("load #{}", i + 1),
+                    );
+                    println!("SOFTDEP\t{m}\t{kind}\t{d}\t{outcome}");
+                }
+            }
+        }
+        if device == "dada" {
+            let options = |name| plan[positions[name]].1.as_str();
+            assert_eq!(options("lz4asm"), "support=1");
+            assert_eq!(options("minidump"), "stack_dump=true");
+            assert!(positions["qcom_cpucp"] < positions["qcom_scmi_vendor"] && positions["qcom_scmi_vendor"] < positions["qcom_scmi_client"],
+                "the stock SCMI pre-softdeps must be expanded in order");
+            assert!(positions["sched_penalty"] < positions["msm_performance"], "stock sched_penalty post-softdep must be expanded");
+        }
+    }
 
     /// The 13 Ultra's command line, as its recovery read it.
     const ISHTAR: &str = "stack_depot_disable=on kasan.stacktrace=off kvm-arm.mode=protected cgroup_disable=pressure console=ttyMSM0,115200n8 kpti=0 kernel.panic_on_rcu_stall=1 service_locator.enable=1 msm_rtb.filter=0x237 rcupdate.rcu_expedited=1 rcu_nocbs=0-7 ftrace_dump_on_oops swiotlb=noforce loop.max_part=7 fw_devlink.strict=1 allow_mismatched_32bit_el0 cpufreq.default_governor=performance printk.console_no_auto_verbose=0 kasan=off sysctl.kernel.sched_pelt_multiplier=4 can.stats_timer=0 pcie_ports=compat irqaffinity=0-2 disable_dma32=on no-steal-acc cgroup.memory=nokmem,nosocket video=vfb:640x400,bpp=32,memsize=3072000 disable_dma32=on swinfo.fingerprint=ishtar:13/OS3.0.308.0.WMACNXM:user mtdoops.fingerprint=ishtar:13/OS3.0.308.0.WMACNXM:user bootconfig  bootinfo.pureason=0x40001 bootinfo.pdreason=0x2 debug_ext.initrd_size=78178 hwid.hwid_value=589824 hwid.project=5 hwid.build_adc=65616 hwid.project_adc=20488 msm_drm.dsi_display0=qcom,mdss_dsi_m1_42_02_0a_dsc_cmd: msm_drm.oled_wp=01f2030002030104 msm_drm.debugpolicy=0x20 rootwait ro init=/init log_buf_len=2M loglevel=6 qcom_geni_serial.con_enabled=0 block2mtd.block2mtd=/dev/block/sda19,2097152 mtdoops.mtddev=0 mtdoops.record_size=2097152 mtdoops.dump_oops=0 printk.always_kmsg_dump=1 silent_boot.mode=nonsilent\n";
