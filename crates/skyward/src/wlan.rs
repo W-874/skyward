@@ -648,17 +648,21 @@ fn place(file: &Firmware) -> Result<()> {
     let to = Path::new(FIRMWARE).join(&file.name);
     let dir = to.parent().expect("a firmware file is in a folder");
     fs::create_dir_all(dir).with_context(|| format!("make {}", dir.display()))?;
-    let bytes = match &file.partition {
-        None => fs::read(&file.path).with_context(|| format!("read {}", file.path))?,
+    let read = match &file.partition {
+        None => fs::read(&file.path),
         Some(partition) => {
             let at = Path::new(PARTITIONS).join(partition);
             fs::create_dir_all(&at).with_context(|| format!("make {}", at.display()))?;
             skyward_block::mount::mount_ro(&Path::new(skyward_block::BY_NAME).join(partition), &at)?;
-            let read = fs::read(at.join(&file.path)).with_context(|| format!("read {} on {partition}", file.path));
+            let read = fs::read(at.join(&file.path));
             skyward_block::mount::umount(&at)?;
-            read?
+            read
         }
     };
+    if file.optional && read.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
+        return Ok(());
+    }
+    let bytes = read.with_context(|| format!("read {} from {}", file.path, file.partition.as_deref().unwrap_or("the recovery")))?;
     fs::write(&to, bytes).with_context(|| format!("write {}", to.display()))
 }
 

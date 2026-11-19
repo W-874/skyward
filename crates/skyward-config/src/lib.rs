@@ -152,6 +152,9 @@ pub struct FirmwarePartition {
 /// A file a driver asks the firmware loader for, and where it is.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Firmware {
+    /// Let the driver use its own fallback when the source file is absent.
+    #[serde(default)]
+    pub optional: bool,
     /// The name the driver asks for, from the top of the loader's folders.
     pub name: String,
     /// Where the file is: a path in the running recovery, or from the top
