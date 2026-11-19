@@ -487,7 +487,7 @@ fn install_system(ctx: &Context, contents: &skyward_systems::package::Contents) 
     let program = fs::read(&program).with_context(|| format!("read {}", program.display()))?;
     let mut zip = zip::ZipArchive::new(BufReader::with_capacity(1 << 20, File::open(fuse::PACKAGE).context("open the package")?)).context("read the package")?;
     let mut told: Option<Instant> = None;
-    skyward_systems::install::install(&mut zip, contents, size, &program, slot, &mut |step| {
+    skyward_systems::install::install(&mut zip, contents, size, &program, &mut |step| {
         let stage = match step {
             skyward_systems::install::Step::Allocating { done, total } => Stage::Allocating { done, total },
             skyward_systems::install::Step::Writing { done, total } => Stage::Root { done, total },

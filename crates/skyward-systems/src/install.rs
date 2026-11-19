@@ -75,7 +75,7 @@ pub use sys::*;
 mod sys {
     use super::*;
     use crate::boot::{self, Start};
-    use crate::package::{Contents, BOOT, INIT_BOOT, ROOT};
+    use crate::package::{self, Contents, HostDigests, BOOT, INIT_BOOT, ROOT};
     use anyhow::Result;
     use crate::state::{System, Who, PATH};
     use crate::store::{self, OTHER};
@@ -244,17 +244,28 @@ mod sys {
             || sum_of(&store::partition(by_name(), "dtbo", slot))? != system.dtbo)
     }
 
-    /// Install the system in the package `zip`, whose contents are
-    /// `contents`, with a root of `size` bytes: its root written into a
-    /// new area of the data partition, which has to be open, and its boot
-    /// set, with `program` to start it, put in the store, made where there
-    /// is none yet. `slot` is the slot the phone runs from, whose
-    /// init_boot image lends its header.
-    pub fn install<R: Read + Seek>(zip: &mut ZipArchive<R>, contents: &Contents, size: u64, program: &[u8], slot: Slot, progress: &mut dyn FnMut(Step)) -> Result<()> {
-        writable(|| install_now(zip, contents, size, program, slot, progress))
+    /// Install the package whose contents the installer offered to the user.
+    /// Its root goes into a new area of the open data partition and its
+    /// boot set goes into the store, alongside `program` to start it.
+    pub fn install<R: Read + Seek>(zip: &mut ZipArchive<R>, contents: &Contents, size: u64, program: &[u8], progress: &mut dyn FnMut(Step)) -> Result<()> {
+        let actual = package::read(zip)?;
+        ensure!(actual == *contents, "the package contents changed before installation");
+        // Use the slot booted by recovery, not the next active slot or
+        // anything specified by the package. Check before changing mounts,
+        // allocating areas, mapping devices, writing images or saving state.
+        let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
+        let host = actual.manifest.check_host(
+            || {
+                let config = Path::new("/").join(skyward_config::ramdisk::CONFIG);
+                let text = fs::read_to_string(&config).with_context(|| format!("read {}", config.display()))?;
+                skyward_config::codename(&text)
+            },
+            |name| sum_of(&store::partition(by_name(), name, slot)),
+        )?;
+        writable(|| install_now(zip, &actual, size, program, slot, host, progress))
     }
 
-    fn install_now<R: Read + Seek>(zip: &mut ZipArchive<R>, contents: &Contents, size: u64, program: &[u8], slot: Slot, progress: &mut dyn FnMut(Step)) -> Result<()> {
+    fn install_now<R: Read + Seek>(zip: &mut ZipArchive<R>, contents: &Contents, size: u64, program: &[u8], slot: Slot, host: HostDigests, progress: &mut dyn FnMut(Step)) -> Result<()> {
         let path = Path::new(PATH);
         let mut state = State::load(path)?;
         ensure!(state.switching.is_none(), "a switch begun before is not done yet");
@@ -300,8 +311,14 @@ mod sys {
                 root: root.clone(),
                 set,
                 own_ramdisk,
-                vendor_boot: sum_of(&store::partition(by_name(), "vendor_boot", slot))?,
-                dtbo: sum_of(&store::partition(by_name(), "dtbo", slot))?,
+                vendor_boot: match host.vendor_boot {
+                    Some(sum) => sum,
+                    None => sum_of(&store::partition(by_name(), "vendor_boot", slot))?,
+                },
+                dtbo: match host.dtbo {
+                    Some(sum) => sum,
+                    None => sum_of(&store::partition(by_name(), "dtbo", slot))?,
+                },
             })
         })();
         match made {

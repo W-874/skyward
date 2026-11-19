@@ -30,10 +30,48 @@ pub struct Manifest {
     /// too little to run in.
     #[serde(default)]
     pub minimum: u64,
+    /// The recovery device's codename, when the package is device-bound.
+    pub device: Option<String>,
+    /// Hex SHA-256 of the entire host boot partition in the booted slot.
+    pub host_boot_sha256: Option<String>,
+    /// Hex SHA-256 of the entire host vendor_boot partition in that slot.
+    pub host_vendor_boot_sha256: Option<String>,
+    /// Hex SHA-256 of the entire host dtbo partition in that slot.
+    pub host_dtbo_sha256: Option<String>,
 }
 
 fn default_init() -> String {
     "/sbin/init".into()
+}
+
+/// Verified host fingerprints that are also used for the post-install change check.
+#[cfg(any(target_os = "android", test))]
+#[derive(Debug)]
+pub(crate) struct HostDigests {
+    pub vendor_boot: Option<String>,
+    pub dtbo: Option<String>,
+}
+
+#[cfg(any(target_os = "android", test))]
+impl Manifest {
+    /// Read and check only the host identity and partitions the package binds.
+    pub(crate) fn check_host(&self, device: impl FnOnce() -> Result<String>, mut sum: impl FnMut(&str) -> Result<String>) -> Result<HostDigests> {
+        if let Some(expected) = &self.device {
+            let actual = device().context("read the recovery device codename for package binding")?;
+            ensure!(actual == *expected, "the package requires device {expected:?}, but this recovery is for {actual:?}");
+        }
+        let mut check = |name: &str, field: &str, expected: Option<&str>| -> Result<Option<String>> {
+            let Some(expected) = expected else { return Ok(None) };
+            let actual = sum(name).with_context(|| format!("check {field} against the host {name} partition"))?;
+            ensure!(actual.eq_ignore_ascii_case(expected), "{field} mismatch: the package requires {expected}, but the host {name} partition has SHA-256 {actual}");
+            Ok(Some(actual))
+        };
+        check("boot", "host_boot_sha256", self.host_boot_sha256.as_deref())?;
+        Ok(HostDigests {
+            vendor_boot: check("vendor_boot", "host_vendor_boot_sha256", self.host_vendor_boot_sha256.as_deref())?,
+            dtbo: check("dtbo", "host_dtbo_sha256", self.host_dtbo_sha256.as_deref())?,
+        })
+    }
 }
 
 /// What a package holds, as far as installing it goes.
@@ -83,6 +121,18 @@ fn check(m: &Manifest) -> Result<()> {
     ensure!(m.version.chars().count() <= 32, "the system's version {:?} is longer than 32 characters", m.version);
     ensure!(!m.filesystem.is_empty() && m.filesystem.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()), "the filesystem {:?} is no kernel's name of one", m.filesystem);
     ensure!(m.init.starts_with('/'), "the program the system starts with, {:?}, is not a full path", m.init);
+    if let Some(device) = &m.device {
+        ensure!(!device.trim().is_empty(), "device must be a nonempty device codename");
+    }
+    for (field, digest) in [
+        ("host_boot_sha256", &m.host_boot_sha256),
+        ("host_vendor_boot_sha256", &m.host_vendor_boot_sha256),
+        ("host_dtbo_sha256", &m.host_dtbo_sha256),
+    ] {
+        if let Some(digest) = digest {
+            ensure!(digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()), "{field} must be a 64-digit hexadecimal SHA-256");
+        }
+    }
     Ok(())
 }
 
@@ -130,5 +180,108 @@ pub(crate) mod tests {
         let minimum = b"id = \"x\"\nname = \"x\"\nversion = \"1\"\nfilesystem = \"ext4\"\nminimum = 4096\n";
         let c = read_of(&[(MANIFEST, minimum), (BOOT, &[1u8; 3]), (ROOT, &[1u8; 3]), (INIT_BOOT, &[1u8; 3])]).unwrap();
         assert_eq!((c.least(), c.init_boot), (4096, true));
+    }
+}
+
+#[cfg(test)]
+mod host_tests {
+    use super::tests::{zip, MANIFEST_TEXT};
+    use super::*;
+    use std::io::Cursor;
+
+    fn manifest(extra: &str) -> Result<Manifest> {
+        let mut text = MANIFEST_TEXT.to_vec();
+        text.extend_from_slice(extra.as_bytes());
+        let bytes = zip(&[(MANIFEST, &text), (BOOT, b"guest boot"), (ROOT, b"guest root")]);
+        Ok(read(&mut ZipArchive::new(Cursor::new(bytes))?)?.manifest)
+    }
+
+    const PARTITIONS: [(&str, &str, &str); 3] = [
+        ("boot", "host_boot_sha256", "ab"),
+        ("vendor_boot", "host_vendor_boot_sha256", "cd"),
+        ("dtbo", "host_dtbo_sha256", "ef"),
+    ];
+
+    fn fully_bound() -> Manifest {
+        use std::fmt::Write as _;
+        let mut fields = String::from("device = \"dada\"\n");
+        for (_, field, pair) in PARTITIONS {
+            writeln!(fields, "{field} = \"{}\"", pair.repeat(32).to_ascii_uppercase()).unwrap();
+        }
+        manifest(&fields).unwrap()
+    }
+
+    fn host_sum(name: &str) -> String {
+        let (_, _, pair) = PARTITIONS.iter().find(|(partition, _, _)| *partition == name).expect("a host boot partition");
+        pair.repeat(32)
+    }
+
+    #[test]
+    fn matching_device_and_host_partitions_are_accepted() {
+        let mut checked = Vec::new();
+        let verified = fully_bound().check_host(|| Ok("dada".into()), |name| {
+            checked.push(name.to_owned());
+            Ok(host_sum(name))
+        }).unwrap();
+        assert_eq!(checked, ["boot", "vendor_boot", "dtbo"]);
+        assert_eq!(verified.vendor_boot, Some(host_sum("vendor_boot")));
+        assert_eq!(verified.dtbo, Some(host_sum("dtbo")));
+    }
+
+    #[test]
+    fn any_device_or_host_digest_mismatch_is_refused() {
+        let m = fully_bound();
+        let error = m.check_host(|| Ok("fuxi".into()), |_| panic!("reject the wrong device before hashing")).unwrap_err().to_string();
+        assert!(error.contains("device") && error.contains("dada") && error.contains("fuxi"), "{error}");
+        for (partition, field, _) in PARTITIONS {
+            let wrong = "01".repeat(32);
+            let error = m.check_host(|| Ok("dada".into()), |name| {
+                Ok(if name == partition { wrong.clone() } else { host_sum(name) })
+            }).unwrap_err().to_string();
+            assert!(error.contains(field) && error.contains(&wrong) && error.contains(&host_sum(partition).to_ascii_uppercase()), "{error}");
+        }
+    }
+
+    #[test]
+    fn missing_bindings_do_not_require_host_reads() {
+        let m = manifest("").unwrap();
+        assert!(m.device.is_none() && m.host_boot_sha256.is_none() && m.host_vendor_boot_sha256.is_none() && m.host_dtbo_sha256.is_none());
+        let verified = m.check_host(|| panic!("no device binding"), |_| panic!("no digest binding")).unwrap();
+        assert!(verified.vendor_boot.is_none() && verified.dtbo.is_none());
+
+        let dtbo = host_sum("dtbo");
+        let m = manifest(&format!("host_dtbo_sha256 = \"{dtbo}\"\n")).unwrap();
+        let verified = m.check_host(|| panic!("no device binding"), |name| {
+            assert_eq!(name, "dtbo");
+            Ok(dtbo.clone())
+        }).unwrap();
+        assert_eq!(verified.dtbo, Some(dtbo));
+        assert!(verified.vendor_boot.is_none());
+    }
+
+    #[test]
+    fn a_required_host_identity_or_partition_that_cannot_be_read_is_refused() {
+        let m = fully_bound();
+        let error = m.check_host(|| anyhow::bail!("no recovery config"), |_| panic!("no recovery device codename"));
+        assert!(format!("{:#}", error.unwrap_err()).contains("no recovery config"));
+        for (partition, field, _) in PARTITIONS {
+            let error = m.check_host(|| Ok("dada".into()), |name| {
+                ensure!(name != partition, "unreadable partition");
+                Ok(host_sum(name))
+            });
+            let error = format!("{:#}", error.unwrap_err());
+            assert!(error.contains(field) && error.contains("unreadable partition"), "{error}");
+        }
+    }
+
+    #[test]
+    fn malformed_binding_values_are_refused_when_reading_the_package() {
+        assert!(manifest("device = \" \"\n").unwrap_err().to_string().contains("device"));
+        for (_, field, _) in PARTITIONS {
+            for invalid in ["ff".into(), "xx".repeat(32)] {
+                let error = manifest(&format!("{field} = \"{invalid}\"\n")).unwrap_err().to_string();
+                assert!(error.contains(field) && error.contains("64-digit hexadecimal SHA-256"), "{error}");
+            }
+        }
     }
 }
