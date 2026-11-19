@@ -33,6 +33,8 @@ pub struct Asked {
     pub shutdown_after: bool,
     /// Work the recovery does not do, as it was asked.
     pub unhandled: Option<String>,
+    /// The recovery rejected automatic work rather than not supporting it.
+    pub refused: bool,
 }
 
 /// Which slots an image goes to, by the slot the phone runs from.

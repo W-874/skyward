@@ -1,10 +1,9 @@
 //! The second system's work for the pages, on a thread of its own so the
-//! screen goes on while the boot partitions are written: the systems read,
-//! a switch between them, and the second system removed, one task after
-//! another, each ending with the systems read again.
+//! screen goes on while the systems are read, switched, exported from, or
+//! removed, one task after another, each ending with the systems read again.
 
 use anyhow::{Context, Result};
-use skyward_systems::{install, Overview, State, Who};
+use skyward_systems::{install, log_export, Overview, State, Who};
 use skyward_vab::Slot;
 use std::os::fd::RawFd;
 use std::sync::mpsc::{self, Sender};
@@ -21,6 +20,8 @@ pub enum Task {
     SwitchNamed(String),
     /// Remove the second system.
     Remove,
+    /// Copy the second system's diagnostics out of its read-only root.
+    ExportGuestLogs,
 }
 
 pub enum Event {
@@ -32,6 +33,8 @@ pub enum Event {
     Switched(Who),
     /// The task failed, and why.
     Failed(String),
+    /// The export path, or why export or cleanup failed.
+    GuestLogsExported(Result<String, String>),
     /// The systems as read once the task ended, or why they could not be;
     /// every task ends with them.
     Read(Result<Overview, String>),
@@ -102,6 +105,13 @@ fn named(name: &str) -> Result<Who> {
     Who::named(name, &install::state()?).with_context(|| format!("no system named {name:?} is installed"))
 }
 
+/// Resolve the recorded root without resuming a switch or changing state.
+fn export_guest_logs() -> Result<String> {
+    let state = install::state()?;
+    let system = state.system.as_ref().context("no second system is installed")?;
+    Ok(log_export::export(&system.root)?.display().to_string())
+}
+
 /// The work on the systems, from a thread of its own.
 pub struct Worker {
     /// The thread ends once it has no more tasks to take: this end goes
@@ -128,6 +138,7 @@ impl Worker {
                     Task::Switch(to) => Some(switched(switch(to).map(|()| to))),
                     Task::SwitchNamed(name) => Some(switched(named(&name).and_then(|to| switch(to).map(|()| to)))),
                     Task::Remove => install::remove().err().map(|e| Event::Failed(format!("{e:#}"))),
+                    Task::ExportGuestLogs => Some(Event::GuestLogsExported(export_guest_logs().map_err(|e| format!("{e:#}")))),
                 };
                 if let Some(event) = told {
                     tell.tell(event);

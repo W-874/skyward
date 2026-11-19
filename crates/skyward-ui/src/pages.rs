@@ -3668,17 +3668,15 @@ const SECOND_FAILED: Text = ["第二系统未能启动", "第二系統未能啟�
 /// partitions, and the second, whose files lie in the data partition, or
 /// the place to install one, the one that starts next checked. Picking the
 /// other and swiping writes its boot images into the slot that starts
-/// next, and restarts into it. Under them, the second system, and removing
-/// it.
+/// next, and restarts into it. Under them are the second system's size,
+/// diagnostic export and removal controls.
 pub fn systems(cx: &Ctx) -> Frame {
     let (t, f, s, i, l) = (cx.t, cx.f, cx.state, cx.info, cx.state.lang);
     let mut c = long_page(cx);
     let mut out = Vec::new();
     let top = t.m.content_top;
     let title = l.pick(DUAL_BOOT);
-    // While the boot partitions are written, or the second system removed,
-    // the page only says so: of a switch the system asked for, perhaps
-    // before the systems are read.
+    // While a systems task runs, the page only shows its progress.
     if let Some(work) = s.systems_work {
         let (heading, detail) = match work {
             SystemsWork::Switching(to) => {
@@ -3696,6 +3694,10 @@ pub fn systems(cx: &Ctx) -> Frame {
             SystemsWork::Removing => (
                 l.pick(["正在删除第二系统", "正在刪除第二系統", "Removing the second system"]).to_string(),
                 l.pick(["正在归还 data 分区中的空间", "正在歸還 data 分割區中的空間", "Giving its room back to the data partition"]),
+            ),
+            SystemsWork::ExportingLogs => (
+                l.pick(["正在导出第二系统日志", "正在匯出第二系統日誌", "Exporting second system logs"]).to_string(),
+                l.pick(["正在从只读文件系统复制日志和状态", "正在從唯讀檔案系統複製日誌和狀態", "Copying logs and state from a read-only filesystem"]),
             ),
         };
         let y = widgets::progress_card(&mut c, t, f, top, &heading, detail, None);
@@ -3790,13 +3792,25 @@ pub fn systems(cx: &Ctx) -> Frame {
         y = widgets::section(&mut c, t, f, y, second_role);
         let size = fmt::bytes(other.size);
         let facts = widgets::list(&mut c, t, f, y, &[Row::new(l.pick(["占用空间", "佔用空間", "Space used"])).trail(Trail::Text(&size))]);
+        let label = l.pick(["导出第二系统日志", "匯出第二系統日誌", "Export second system logs"]);
+        let (export, act) = if s.data.storage_open() {
+            (Row::new(label).trail(Trail::None), Action::ExportGuestLogs)
+        } else {
+            (Row::new(label).subtitle(l.pick(DECRYPT_NEEDED)), Action::Open(Screen::Decrypt))
+        };
+        let exporting = widgets::list(&mut c, t, f, facts.bottom + t.m.card_gap, &[export]);
+        out.extend(hits(&exporting.rows, &[act]));
+        y = exporting.bottom;
+        if let Some(path) = &s.system_logs {
+            y = widgets::info_card(&mut c, t, f, y + t.m.card_gap, &[(l.pick(["日志已保存至", "日誌已儲存至", "Logs saved to"]), path.clone())]);
+        }
         let mounted = matches!(s.data, Data::Open | Data::Locked { .. });
         let remove = Row::new(l.pick(["删除第二系统", "刪除第二系統", "Remove the second system"])).tint(t.pal.danger);
         let (remove, act) = match mounted {
             true => (remove.trail(Trail::None), Action::AskDelete),
             false => (remove.subtitle(l.pick(DECRYPT_NEEDED)), Action::Open(Screen::Decrypt)),
         };
-        let removing = widgets::list(&mut c, t, f, facts.bottom + t.m.card_gap, &[remove]);
+        let removing = widgets::list(&mut c, t, f, y + t.m.card_gap, &[remove]);
         out.extend(hits(&removing.rows, &[act]));
         y = removing.bottom;
         if s.asking_delete && mounted {
@@ -4000,12 +4014,17 @@ pub fn unhandled(cx: &Ctx) -> Frame {
     let mut c = page(cx);
     let mut out = Vec::new();
     let top = t.m.content_top;
-    let mut items = vec![(l.pick(["请求", "要求", "Request"]), s.asked.unhandled.clone().unwrap_or_default())];
+    let label = if s.asked.refused { l.pick(["已拒绝", "已拒絕", "Refused"]) } else { l.pick(["请求", "要求", "Request"]) };
+    let mut items = vec![(label, s.asked.unhandled.clone().unwrap_or_default())];
     if let Some(reason) = &s.asked.reason {
         items.push((l.pick(REASON), reason.clone()));
     }
     let y = widgets::info_card(&mut c, t, f, top, &items);
-    let y = widgets::footnote(&mut c, t, f, y, l.pick(["Skyward 暂不支持该请求，本机未做任何改动。", "Skyward 尚不支援這項要求，本機未做任何變更。", "Skyward doesn't support this request, and changed nothing on this phone."]));
+    let y = if s.asked.refused {
+        y
+    } else {
+        widgets::footnote(&mut c, t, f, y, l.pick(["Skyward 暂不支持该请求，本机未做任何改动。", "Skyward 尚不支援這項要求，本機未做任何變更。", "Skyward doesn't support this request, and changed nothing on this phone."]))
+    };
     let y = widgets::section(&mut c, t, f, y, l.pick(ACTIONS));
     afterwards(&mut c, t, f, l, y, true, &mut out);
     Frame { back: false, ..Frame::new(t, c, out, l.pick(["无法处理该请求", "無法處理這項要求", "Can't handle the request"]), top) }

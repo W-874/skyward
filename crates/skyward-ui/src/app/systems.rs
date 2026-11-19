@@ -32,6 +32,8 @@ pub enum SystemsWork {
     Switching(Who),
     /// Taking the other system away.
     Removing,
+    /// Copying logs and state from the second system's read-only root.
+    ExportingLogs,
 }
 
 impl App {
@@ -57,23 +59,36 @@ impl App {
         }
     }
 
-    /// The systems, as the runtime read them, or why it could not; work on
-    /// them that was under way has ended.
+    /// The systems as last read. Exports end with their own result, since
+    /// a previously queued overview read may arrive during an export.
     pub fn set_systems(&mut self, systems: Result<Overview, String>) {
         self.state.systems = Some(systems);
-        self.state.systems_work = None;
+        if self.state.systems_work != Some(SystemsWork::ExportingLogs) {
+            self.state.systems_work = None;
+        }
+        if matches!(&self.state.systems, Some(Ok(systems)) if systems.other.is_none()) {
+            self.state.system_logs = None;
+        }
         self.refresh();
     }
 
-    /// Why the work on the systems the page asked for did not go: the
-    /// switch did not happen, or the other system was not taken away.
+    /// Why the work on the systems the page asked for did not go.
     pub fn systems_work_failed(&mut self, why: &str, now: u64) {
         let l = self.state.lang;
         let said = match self.state.systems_work.take() {
             Some(SystemsWork::Removing) => tr!(l, "删除失败：{why}", "刪除失敗：{why}", "Couldn't remove: {why}"),
+            Some(SystemsWork::ExportingLogs) => tr!(l, "导出日志失败：{why}", "匯出日誌失敗：{why}", "Couldn't export logs: {why}"),
             _ => tr!(l, "切换失败：{why}", "切換失敗：{why}", "Couldn't switch: {why}"),
         };
         self.say(&said, now);
+        self.refresh();
+    }
+
+    /// Report the finished export and keep its destination visible.
+    pub fn guest_logs_exported(&mut self, path: String, now: u64) {
+        self.state.systems_work = None;
+        self.state.system_logs = Some(path);
+        self.say(self.state.lang.pick(["第二系统日志已导出", "第二系統日誌已匯出", "Second system logs exported"]), now);
         self.refresh();
     }
 
@@ -296,6 +311,34 @@ mod tests {
         assert!(app.frame(&f, &i).hits.iter().all(|h| h.action != Action::AskDelete), "nothing left to remove");
         tap(&mut app, &f, &i, Action::Open(Screen::Install));
         assert_eq!(app.screen(), Screen::Install, "the empty place opens the install page");
+    }
+
+    #[test]
+    fn guest_log_export_requires_owner_storage_and_waits_for_its_own_result() {
+        let (f, i) = (fonts(), info());
+        let mut app = systems_page(&f, &i, two_systems());
+        app.data_waiting(Some((0, Keys::Digits)));
+        let hits = &app.frame(&f, &i).hits;
+        assert!(hits.iter().any(|h| h.action == Action::Open(Screen::Decrypt)));
+        assert!(hits.iter().all(|h| h.action != Action::ExportGuestLogs));
+
+        // Owner storage is ready even if a secondary user is still locked.
+        app.data_waiting(Some((10, Keys::Digits)));
+        assert_eq!(tap(&mut app, &f, &i, Action::ExportGuestLogs), vec![Effect::ExportGuestLogs]);
+        app.set_systems(Ok(two_systems()));
+        assert_eq!(app.state.systems_work, Some(SystemsWork::ExportingLogs));
+        assert!(app.frame(&f, &i).hits.is_empty(), "other systems actions stay unavailable until cleanup is done");
+        let path = "/data/media/0/skyward-guest-logs/1700000000.000000000";
+        app.guest_logs_exported(path.into(), 0);
+        assert_eq!(app.state.systems_work, None);
+        assert_eq!(app.state.system_logs.as_deref(), Some(path));
+
+        assert_eq!(tap(&mut app, &f, &i, Action::ExportGuestLogs), vec![Effect::ExportGuestLogs]);
+        app.systems_work_failed("fixture failure", 0);
+        assert_eq!(app.state.systems_work, None);
+        assert_eq!(app.state.system_logs, None);
+        app.set_systems(Ok(Overview { other: None, ..two_systems() }));
+        assert!(app.frame(&f, &i).hits.iter().all(|h| h.action != Action::ExportGuestLogs));
     }
 
     #[test]

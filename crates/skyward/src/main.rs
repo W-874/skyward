@@ -29,6 +29,8 @@ mod pty;
 mod readings;
 #[cfg(target_os = "android")]
 mod relabel;
+#[cfg(any(target_os = "android", test))]
+mod request;
 #[cfg(target_os = "android")]
 mod secure;
 #[cfg(target_os = "android")]
@@ -447,7 +449,7 @@ fn main() -> Result<()> {
                 Ok(steps) => programs.extend(keys::programs(&steps)),
                 Err(e) => eprintln!("the programs of the phone's keys are not known: {e:#}"),
             }
-            ui::run(&cfg, &programs, &font, &mono, bcb::Request::default(), start, dump.as_deref())
+            ui::run(&cfg, &programs, &font, &mono, request::Startup::default(), start, dump.as_deref())
         }
     }
 }
@@ -733,17 +735,18 @@ fn adopt_installed_version(props: &std::collections::HashMap<String, String>) ->
     Ok(())
 }
 
-/// The recovery service. Its own folder is made and its log kept there from
-/// the start, and adb comes up first so a failure later on can be
-/// inspected, file transfer joining it
-/// once the screen starts; then the boot request in misc is read. A
-/// request whose work
-/// goes on stays in misc until the work is done; any other is cleared at
-/// once, so that any reboot from here boots the system. Failures go to the
-/// kernel log and still end the process, which init then starts again.
+/// The recovery service. Reject unsafe work before setting up the recovery
+/// or letting any request alter misc, change the port or start work.
+#[cfg(target_os = "android")]
 fn recovery() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let run = || -> Result<()> {
+        let misc = bcb::misc();
+        let message = bcb::read(&misc)?;
+        let startup = request::Startup::read(&message, &misc, request::other_in_boot_partitions, |work, why| {
+            let _ = skyward_sys::kmsg(&format!("refusing recovery request {work:?} from misc: {why}"));
+        })?;
+        let request = &startup.request;
         // Open to the programs the recovery runs as other users, the
         // supplicant among them, whatever the umask.
         std::fs::create_dir_all(skyward_sys::RUN).with_context(|| format!("make {}", skyward_sys::RUN))?;
@@ -756,12 +759,6 @@ fn recovery() -> Result<()> {
             skyward_sys::usb::set("none", std::time::Duration::from_secs(5))?;
         }
         skyward_sys::set_prop("sys.usb.config", "adb")?;
-        let misc = bcb::misc();
-        let message = bcb::read(&misc)?;
-        let request = message.request();
-        if !request.work.lasts() {
-            bcb::clear(&misc)?;
-        }
         let cfg = DeviceConfig::load(Path::new("/").join(ramdisk::CONFIG))?;
         skyward_sys::kmsg(&format!(
             "{} {} recovery up, misc command {:?} args {:?}, asking for {:?}",
@@ -781,7 +778,6 @@ fn recovery() -> Result<()> {
         // as Android's own recovery counts them, so that one a restart cuts
         // off is taken up again as a retry; one that follows the kernel
         // stopping is not started at all.
-        #[cfg(target_os = "android")]
         if let bcb::Work::Update(update) = &request.work
             && update.retry == 0
             && !ui::panicked()
@@ -791,7 +787,6 @@ fn recovery() -> Result<()> {
         // The kernel starts the clock from the RTC, days after 1970 on these
         // phones; the screen and the files written still work without the
         // real time, so a failure goes to the kernel log.
-        #[cfg(target_os = "android")]
         match skyward_sys::clock::set_from_rtc() {
             Ok(ms) => skyward_sys::kmsg(&format!("clock set to {} ms from the RTC and persist", ms))?,
             Err(e) => skyward_sys::kmsg(&format!("clock not set: {e:#}"))?,
@@ -801,35 +796,39 @@ fn recovery() -> Result<()> {
         // changes that; left so, the phone drains its battery with the
         // screen off. The recovery works either way, so a failure goes to
         // the kernel log.
-        #[cfg(target_os = "android")]
         match skyward_sys::cpu::run_as_system() {
             Ok(done) => skyward_sys::kmsg(&format!("the CPUs run as the system runs them: {}", done.join(", ")))?,
             Err(e) => skyward_sys::kmsg(&format!("the CPUs run as the kernel started them: {e:#}"))?,
         }
-        #[cfg(target_os = "android")]
-        {
-            use skyward_ui::app::Screen;
-            // fastbootd rewrites super, which it cannot do while the slot's
-            // partitions are mapped and mounted, so fastboot runs without
-            // them and without what runs from them. So does work on whole
-            // partitions the system asks for, as in Android's own recovery:
-            // erasing them, which may take super with them, and undoing
-            // shared blocks, which writes to the slot's own.
-            let mut programs = cfg.services.clone();
-            if !matches!(request.work, bcb::Work::Fastboot | bcb::Work::WipeAb { .. } | bcb::Work::UnshareBlocks) {
-                programs.extend(prepare(&cfg, booted_slot()?)?);
+
+        use skyward_ui::app::Screen;
+        // fastbootd rewrites super, which it cannot do while the slot's
+        // partitions are mapped and mounted, so fastboot runs without
+        // them and without what runs from them. So does work on whole
+        // partitions the system asks for, as in Android's own recovery:
+        // erasing them, which may take super with them, and undoing
+        // shared blocks, which writes to the slot's own.
+        let mut programs = cfg.services.clone();
+        if startup.refusal.is_some() {
+            // A failed slot read can itself have caused the refusal.
+            // Keep the notice reachable without the installed services.
+            if let Ok(slot) = booted_slot() {
+                programs.extend(prepare(&cfg, slot)?);
             }
-            let root = Path::new("/");
-            ui::run(&cfg, &programs, &root.join(ramdisk::FONT), &root.join(ramdisk::MONO), request, Screen::Home, None)
+        } else if !matches!(request.work, bcb::Work::Fastboot | bcb::Work::WipeAb { .. } | bcb::Work::UnshareBlocks) {
+            programs.extend(prepare(&cfg, booted_slot()?)?);
         }
-        #[cfg(not(target_os = "android"))]
-        {
-            anyhow::bail!("the recovery service runs only on Android")
-        }
+        let root = Path::new("/");
+        ui::run(&cfg, &programs, &root.join(ramdisk::FONT), &root.join(ramdisk::MONO), startup, Screen::Home, None)
     };
     run().inspect_err(|e| {
         let _ = skyward_sys::kmsg(&format!("recovery failed: {e:#}"));
     })
+}
+
+#[cfg(not(target_os = "android"))]
+fn recovery() -> Result<()> {
+    anyhow::bail!("the recovery service runs only on Android")
 }
 
 /// Map and mount the slot's partitions from super, then bring up what runs

@@ -136,6 +136,20 @@ impl App {
                     self.refresh();
                 }
             }
+            Action::ExportGuestLogs => {
+                if self.screen() == Screen::Systems
+                    && self.state.systems_work.is_none()
+                    && self.state.data.storage_open()
+                    && matches!(&self.state.systems, Some(Ok(systems)) if systems.other.is_some())
+                {
+                    self.state.systems_work = Some(SystemsWork::ExportingLogs);
+                    self.state.system_logs = None;
+                    self.state.asking_delete = false;
+                    self.state.confirm = 0.0;
+                    self.refresh();
+                    return vec![Effect::ExportGuestLogs];
+                }
+            }
             Action::RebootTo(target) => return vec![Effect::Reboot(target)],
             Action::EnterRecovery => return vec![Effect::EnterRecovery],
             Action::Dismiss => {

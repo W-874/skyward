@@ -8,6 +8,7 @@ use crate::merge;
 use crate::partwork;
 use crate::pty;
 use crate::readings::{Reading, Readings};
+use crate::request::{Refusal, Startup};
 use crate::secure;
 use crate::services;
 use crate::settings;
@@ -315,14 +316,28 @@ fn usb_link() -> Result<UsbLink> {
 }
 
 /// What a request from misc shows on the pages that answer it.
-fn asked(request: &bcb::Request) -> Asked {
+fn asked(request: &bcb::Request, refusal: Option<&Refusal>, lang: Lang) -> Asked {
+    let notice = match refusal {
+        Some(Refusal::Other) => Some(lang.pick([
+            "该请求在第二系统运行时发出，已拒绝；如需清除主系统，请先切回主系统再操作。",
+            "這項要求在第二系統執行時發出，已拒絕；若要清除主系統，請先切回主系統再操作。",
+            "This request was made while the second system was running and was refused. Switch back to the installed system before trying to erase it.",
+        ])),
+        Some(Refusal::Unknown(_)) => Some(lang.pick([
+            "无法确认主系统的启动镜像在位，已拒绝该请求。请先确认已切回主系统再操作。",
+            "無法確認主系統的啟動映像在位，已拒絕這項要求。請先確認已切回主系統再操作。",
+            "The request was refused because boot ownership couldn't be verified. Confirm you've switched back to the installed system before trying again.",
+        ])),
+        None => None,
+    };
     Asked {
         reason: request.reason.clone(),
         shutdown_after: request.shutdown_after,
-        unhandled: match &request.work {
+        unhandled: notice.map(str::to_string).or_else(|| match &request.work {
             Work::Unsupported(what) => Some(what.clone()),
             _ => None,
-        },
+        }),
+        refused: refusal.is_some(),
     }
 }
 
@@ -1084,13 +1099,14 @@ fn job_end(end: filework::End) -> JobEnd {
     }
 }
 
-/// Run the pages. What `request`, read from misc, asks for decides the
-/// first of them; asking for nothing, they start at `start`. `programs`
+/// Run the pages. The gated `startup` request decides the first page;
+/// asking for nothing, the pages start at `start`. `programs`
 /// are the phone's own that the recovery keeps running: the
 /// configuration's, and those the phone's partitions name for its keys.
-pub fn run(cfg: &DeviceConfig, programs: &[Service], font: &Path, mono: &Path, request: bcb::Request, start: Screen, dump: Option<&Path>) -> Result<()> {
-    let mut pages = Pages::open(cfg, programs, font, mono, request, start, dump)?;
-    pages.begin()?;
+pub(crate) fn run(cfg: &DeviceConfig, programs: &[Service], font: &Path, mono: &Path, startup: Startup, start: Screen, dump: Option<&Path>) -> Result<()> {
+    let refused = startup.refusal.is_some();
+    let mut pages = Pages::open(cfg, programs, font, mono, startup, start, dump)?;
+    pages.begin(refused)?;
     // The phone sleeps while its screen is off and nothing needs it awake.
     let sleeper = Sleeper::start()?;
     // A uevent may be a charger or a computer attached or taken away: the
@@ -1226,7 +1242,8 @@ impl<'a> Pages<'a> {
     /// Bring up the panel, the touchscreen and the pages, as the settings
     /// kept from the starts before leave them, with none of the work the
     /// request asks for started yet.
-    fn open(cfg: &'a DeviceConfig, programs: &'a [Service], font: &Path, mono: &Path, request: bcb::Request, start: Screen, dump: Option<&'a Path>) -> Result<Pages<'a>> {
+    fn open(cfg: &'a DeviceConfig, programs: &'a [Service], font: &Path, mono: &Path, startup: Startup, start: Screen, dump: Option<&'a Path>) -> Result<Pages<'a>> {
+        let Startup { request, refusal } = startup;
         if cfg.display.density == 0 {
             return Err(anyhow!("{}: [display] density is required to lay out the UI", cfg.device.codename));
         }
@@ -1257,21 +1274,12 @@ impl<'a> Pages<'a> {
         let control = Control::open()?;
         let haptics = cfg.haptics.as_ref().map(Haptics::open).transpose()?;
         let backlight = Backlight::open()?;
-        let first = match &request.work {
-            Work::Fastboot => Screen::Fastboot,
-            Work::PromptWipeData => Screen::CantStart,
-            Work::Unsupported(_) => Screen::Unhandled,
-            Work::Menu
-            | Work::Exit
-            | Work::Update(_)
-            | Work::WipeData { .. }
-            | Work::WipeCache { .. }
-            | Work::WipeAb { .. }
-            | Work::Sideload { .. }
-            | Work::Rescue
-            | Work::UnshareBlocks
-            | Work::SwitchSystem { .. }
-            | Work::SystemStopped => start,
+        let first = match (&request.work, &refusal) {
+            (_, Some(_)) => Screen::Unhandled,
+            (Work::Fastboot, None) => Screen::Fastboot,
+            (Work::PromptWipeData, None) => Screen::CantStart,
+            (Work::Unsupported(_), None) => Screen::Unhandled,
+            _ => start,
         };
         let mut app = App::new(first, w, h, cfg.display.density as f32 / 160.0);
         app.set_screen_corners(cfg.display.corner_radius as f32);
@@ -1296,7 +1304,7 @@ impl<'a> Pages<'a> {
         if info.slot.is_some() {
             app.set_boot_slots(read_slots());
         }
-        app.set_asked(asked(&request));
+        app.set_asked(asked(&request, refusal.as_ref(), app.state.lang));
         let screen = Canvas::new(w, h);
         // A page sliding over another draws on three screens' worth of canvas
         // besides the panel's: made ready now, the first slide finds them so.
@@ -1431,7 +1439,7 @@ impl<'a> Pages<'a> {
     /// Start the work the request in misc asks for, take up what an earlier
     /// start left under way, and bring the port and the WLAN to where the
     /// pages start from.
-    fn begin(&mut self) -> Result<()> {
+    fn begin(&mut self, refused: bool) -> Result<()> {
         let cfg = self.cfg;
         match &self.request.work {
             Work::WipeData { reformat } => {
@@ -1512,7 +1520,7 @@ impl<'a> Pages<'a> {
         }
         // A switch asked for finishes one cut off before itself; fastboot leaves
         // /metadata to fastbootd until the recovery's pages come up.
-        if let (Some(worker), false, false) = (self.systems_worker.as_mut(), self.switch_asked, self.fastboot) {
+        if let (Some(worker), false, false, false) = (self.systems_worker.as_mut(), self.switch_asked, self.fastboot, refused) {
             worker.send(systems::Task::Resume);
         }
         // The port came up with adb alone; at rest it offers file transfer
@@ -1525,7 +1533,7 @@ impl<'a> Pages<'a> {
             skyward_sys::kmsg(&format!("the port did not take file transfer: {e:#}"))?;
             self.app.report(&format!("{e:#}"), monotonic_ms());
         }
-        if let Some(slot) = self.info.slot {
+        if !refused && let Some(slot) = self.info.slot {
             let standing = skyward_vab::standing(slot)?;
             if matches!(standing, Standing::Merging(_)) && skyward_vab::snapshots_mapped(slot)? {
                 skyward_sys::kmsg("the update's merge goes on")?;
@@ -2174,6 +2182,14 @@ impl Pages<'_> {
                     self.switch_asked = false;
                     self.app.systems_work_failed(&why, now);
                 }
+                systems::Event::GuestLogsExported(Ok(path)) => {
+                    skyward_sys::kmsg(&format!("second system logs exported to {path}"))?;
+                    self.app.guest_logs_exported(path, now);
+                }
+                systems::Event::GuestLogsExported(Err(why)) => {
+                    skyward_sys::kmsg(&format!("second system log export failed: {why}"))?;
+                    self.app.systems_work_failed(&why, now);
+                }
                 // The page stays as it is while the phone restarts.
                 systems::Event::Read(read) => {
                     if !self.switched {
@@ -2547,6 +2563,16 @@ impl Pages<'_> {
                 } else {
                     skyward_sys::kmsg(&format!("switching to the {to:?} system, as the systems page asked"))?;
                     self.systems()?.send(systems::Task::Switch(to));
+                }
+            }
+            Effect::ExportGuestLogs => {
+                if self.installer.is_some() {
+                    self.app.systems_work_failed(self.app.state.lang.pick(INSTALL_UNFINISHED), now);
+                } else if !self.app.state.data.storage_open() {
+                    let why = self.app.state.lang.pick(["请先解密内部存储", "請先解密內部儲存空間", "Decrypt internal storage first"]);
+                    self.app.systems_work_failed(why, now);
+                } else {
+                    self.systems()?.send(systems::Task::ExportGuestLogs);
                 }
             }
             Effect::RemoveSystem => {

@@ -92,11 +92,14 @@ impl App {
             Screen::Mount => self.state.mount_failure = None,
             // A slot picked and not switched to is put down.
             Screen::Slot => self.state.next_slot = None,
-            // So is a system; the page stays while the boot partitions are
-            // being written, which nothing may cut short.
+            // So is a system; the page stays while its work is under way.
             Screen::Systems => {
-                if self.state.systems_work.is_some() {
-                    self.say(l.pick(["正在写入，请等待写入完成", "正在寫入，請等待寫入完成", "Writing. Wait for it to finish"]), now);
+                if let Some(work) = self.state.systems_work {
+                    let note = match work {
+                        SystemsWork::ExportingLogs => ["正在导出日志，请稍候", "正在匯出日誌，請稍候", "Exporting logs. Wait for it to finish"],
+                        _ => ["正在写入，请等待写入完成", "正在寫入，請等待寫入完成", "Writing. Wait for it to finish"],
+                    };
+                    self.say(l.pick(note), now);
                     return fx;
                 }
                 self.state.system_pick = None;

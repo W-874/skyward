@@ -75,15 +75,26 @@ const LZ4_LEGACY: [u8; 4] = [0x02, 0x21, 0x4c, 0x18];
 /// init_boot partition may hold, an image that does not read among it, is
 /// none of Skyward's.
 pub fn starts_from_data(image: &[u8]) -> bool {
-    let Ok(image) = BootImage::parse(image) else { return false };
+    inspect_starts_from_data(image).unwrap_or(false)
+}
+
+/// As [`starts_from_data`], without treating an unreadable init_boot image
+/// as evidence that the installed system owns it.
+pub fn inspect_starts_from_data(image: &[u8]) -> Result<bool> {
+    let image = BootImage::parse(image)?;
+    ensure!(image.kernel.is_empty() && !image.ramdisk.is_empty(), "not a ramdisk-only init_boot image");
     let mut before = image.ramdisk.len();
     while let Some(at) = image.ramdisk[..before].windows(LZ4_LEGACY.len()).rposition(|opening| opening == LZ4_LEGACY) {
-        if Ramdisk::decode(&image.ramdisk[at..]).is_ok_and(|archive| archive.find(START).is_some()) {
-            return true;
+        match Ramdisk::decode(&image.ramdisk[at..]) {
+            Ok(archive) if archive.find(START).is_some() => return Ok(true),
+            // A candidate inside compressed data may be a coincidental
+            // match. At the beginning it is the archive's actual header.
+            Err(e) if at == 0 => return Err(e),
+            _ => {}
         }
         before = at;
     }
-    false
+    Ok(false)
 }
 
 /// The init_boot image `image`, as [`init_boot`] made it or, for a system

@@ -8,6 +8,8 @@ use std::collections::HashMap;
 
 pub mod boot;
 pub mod install;
+#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+pub mod log_export;
 pub mod package;
 pub mod state;
 pub mod store;

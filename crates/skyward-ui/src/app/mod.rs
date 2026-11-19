@@ -290,6 +290,8 @@ pub enum Action {
     PickSlot(Slot),
     /// Pick this system to start next; a swipe then switches to it.
     PickSystem(Who),
+    /// Copy the second system's diagnostic volumes to internal storage.
+    ExportGuestLogs,
     /// Give the root of the system being installed the size at this place
     /// in those offered.
     SystemSize(usize),
@@ -461,6 +463,8 @@ pub enum Effect {
     /// Take the other system away, telling how it went with
     /// [`App::set_systems`] or [`App::systems_work_failed`].
     RemoveSystem,
+    /// Export the second system's logs and state without changing its root.
+    ExportGuestLogs,
     /// Install the system the installer holds with a root of `size` bytes.
     InstallSystem { size: u64 },
     /// Mount the slot's partition with this base name, such as `system`.

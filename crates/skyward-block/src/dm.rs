@@ -230,16 +230,22 @@ fn versions(data: &[u8]) -> Result<Vec<(String, [u32; 3])>> {
     Ok(out)
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 mod sys {
     use super::*;
-    use anyhow::{bail, Context};
+    use anyhow::Context;
     use std::fs::{File, OpenOptions};
     use std::os::unix::io::AsRawFd;
+    #[cfg(target_os = "android")]
     use std::path::{Path, PathBuf};
+    #[cfg(target_os = "android")]
     use std::time::{Duration, Instant};
 
+    #[cfg(target_os = "android")]
     const CONTROL: &str = "/dev/device-mapper";
+    #[cfg(target_os = "linux")]
+    const CONTROL: &str = "/dev/mapper/control";
+    #[cfg(target_os = "android")]
     /// How long ueventd gets to make the node of a new device.
     const NODE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -248,13 +254,14 @@ mod sys {
     }
 
     fn call(ctl: &File, request: u32, buf: &mut [u8]) -> std::io::Result<()> {
-        // bionic's ioctl request is a c_int; the bits are reinterpreted.
-        if unsafe { libc::ioctl(ctl.as_raw_fd(), request as libc::c_int, buf.as_mut_ptr()) } != 0 {
+        // The request's bits are the same on Linux and Android, but the C types differ.
+        if unsafe { libc::ioctl(ctl.as_raw_fd(), request as _, buf.as_mut_ptr()) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
         Ok(())
     }
 
+    #[cfg(target_os = "android")]
     /// Create device `name` from `targets` and wait for ueventd to make its
     /// node; returns /dev/block/dm-N. A device that fails to come up is
     /// removed again.
@@ -298,6 +305,7 @@ mod sys {
         call(&control()?, DM_DEV_REMOVE, io.as_mut_bytes()).with_context(|| format!("remove device-mapper device {name}"))
     }
 
+    #[cfg(target_os = "android")]
     /// Give device `name`, which may be in use, `targets` as its table,
     /// read-only or not: the device is suspended while the table is
     /// swapped in, and resumes with it.
@@ -326,17 +334,20 @@ mod sys {
         Ok(io.flags & DM_READONLY_FLAG != 0)
     }
 
+    #[cfg(target_os = "android")]
     /// The targets of device `name`'s live table, with their parameters.
     pub fn table(name: &str) -> Result<Vec<Line>> {
         read_table(name, DM_STATUS_TABLE_FLAG).with_context(|| format!("read the table of {name}"))
     }
 
+    #[cfg(target_os = "android")]
     /// The targets of device `name`'s live table, with what each says of
     /// itself.
     pub fn table_status(name: &str) -> Result<Vec<Line>> {
         read_table(name, 0).with_context(|| format!("read the status of {name}"))
     }
 
+    #[cfg(target_os = "android")]
     fn read_table(name: &str, flags: u32) -> Result<Vec<Line>> {
         let ctl = control()?;
         let mut size = 4096;
@@ -356,6 +367,7 @@ mod sys {
         }
     }
 
+    #[cfg(target_os = "android")]
     /// The version of the kernel's target `kind`, or `None` where the
     /// kernel has no such target.
     pub fn target_version(kind: &str) -> Result<Option<[u32; 3]>> {
@@ -379,11 +391,12 @@ mod sys {
         (libc::major(dev) as u32, libc::minor(dev) as u32)
     }
 
+    #[cfg(target_os = "android")]
     fn wait_for(node: &Path) -> Result<()> {
         let start = Instant::now();
         while !node.exists() {
             if start.elapsed() > NODE_TIMEOUT {
-                bail!("ueventd made no {} within {:?}", node.display(), NODE_TIMEOUT);
+                anyhow::bail!("ueventd made no {} within {:?}", node.display(), NODE_TIMEOUT);
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -392,7 +405,7 @@ mod sys {
 }
 
 #[cfg(not(target_os = "android"))]
-mod sys {
+mod host_stubs {
     use super::{Line, Target};
     use anyhow::{bail, Result};
     use std::path::PathBuf;
@@ -413,10 +426,12 @@ mod sys {
         bail!("this host has no device-mapper to create {name}")
     }
 
+    #[cfg(not(target_os = "linux"))]
     pub fn activate(name: &str, _targets: &[Target], _readonly: bool) -> Result<(u32, u32)> {
         bail!("this host has no device-mapper to create {name}")
     }
 
+    #[cfg(not(target_os = "linux"))]
     pub fn remove(name: &str) -> Result<()> {
         bail!("this host has no device-mapper to remove {name}")
     }
@@ -425,16 +440,25 @@ mod sys {
         bail!("this host has no device-mapper to reload {name}")
     }
 
+    #[cfg(not(target_os = "linux"))]
     pub fn status(name: &str) -> Result<Option<(u32, u32)>> {
         bail!("this host has no device-mapper to look up {name}")
     }
 
+    #[cfg(not(target_os = "linux"))]
     pub fn readonly(name: &str) -> Result<bool> {
         bail!("this host has no device-mapper to look up {name}")
     }
 }
 
-pub use sys::{activate, create, readonly, reload, remove, status, table, table_status, target_version};
+#[cfg(not(target_os = "android"))]
+pub use host_stubs::{create, reload, table, table_status, target_version};
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
+pub use host_stubs::{activate, readonly, remove, status};
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub use sys::{activate, readonly, remove, status};
+#[cfg(target_os = "android")]
+pub use sys::{create, reload, table, table_status, target_version};
 
 #[cfg(test)]
 mod tests {
