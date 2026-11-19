@@ -21,7 +21,7 @@ load = ["fts_touch_spi"]
 # What /odm/etc/init/vendor.xiaomi.hw.touchfeature@1.0-service.rc hands to
 # the system user on boot, which has the same chown and chmod lines as the
 # 13 Ultra's: the touch layer's own nodes, its switches and the driver's
-# files in /proc, which the touch programs below open as that user. These
+# files in /proc. These
 # are the 13 Ultra's, which were each seen made as the touch modules load
 # there, less those whose names this phone's xiaomi_touch.ko and
 # fts_touch_spi.ko do not carry.
@@ -76,7 +76,7 @@ paths = [
 # their highest clock; the script hands them to WALT, lets idle CPUs power
 # down and sets how the memory bus scales. Without it the CPUs stay at
 # their highest clock and voltage even while idle, and the phone slowly
-# heats up. It runs before the touch programs, which need none of it.
+# heats up.
 [[service]]
 path = "/vendor/bin/sh"
 args = ["/vendor/bin/init.kernel.post_boot.sh"]
@@ -85,20 +85,8 @@ oneshot = true
 user = "root"
 groups = ["root", "system", "wakelock", "graphics"]
 
-# The panel hands raw frames to the host, as on the 13 Ultra. touch_report
-# turns them into touches on the fts input device; touchsensor tells water,
-# gloves and screen protectors apart with the models in /odm/firmware.
-[[service]]
-path = "/odm/bin/touch_report"
-user = "system"
-groups = ["system", "uhid", "input"]
-capabilities = ["SYS_NICE"]
-
-[[service]]
-path = "/odm/bin/touchsensor"
-libraries = ["/odm/lib64", "/system/lib64"]
-user = "system"
-groups = ["system", "uhid", "input"]
+# The stock touchfeature script names touch_report and touchsensor, but
+# this build's ODM partition carries neither executable.
 
 # WLAN: the same converged node in the device tree as the 13 Ultra's, which
 # names no one chip. The phone's own modules.load lists qca_cld3_kiwi,
@@ -113,7 +101,7 @@ modules = ["qca_cld3_kiwi_v2"]
 writes = [{ path = "/sys/kernel/cnss/fs_ready", value = "1" }]
 firmware = [
     { name = "wlan/qca_cld/kiwi_v2/WCNSS_qcom_cfg.ini", path = "/vendor/etc/wifi/kiwi_v2/WCNSS_qcom_cfg.ini" },
-    { name = "wlan/qca_cld/kiwi_v2/wlan_mac.bin", partition = "persist", path = "kiwi_v2/wlan_mac.bin" },
+    { name = "wlan/qca_cld/kiwi_v2/wlan_mac.bin", partition = "persist", path = "kiwi_v2/wlan_mac.bin", optional = true },
 ]
 interface = "wlan0"
 supplicant = "/vendor/bin/hw/wpa_supplicant"
