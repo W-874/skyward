@@ -181,6 +181,23 @@ pub fn gatekeeper_password(stretched: &[u8]) -> Vec<u8> {
     personalized_hash(GATEKEEPER, &[stretched])
 }
 
+/// Which of the secure world's slots a user's typed credential sits in: a
+/// hundred thousand above their own number, kept apart from the enrolments
+/// made before phones kept credentials this way.
+pub const TYPED_SLOT: u32 = 100_000;
+
+/// How far above the usual slot a recovery presents the owner's own
+/// enrolled handle when another system has overwritten the usual one. The
+/// handle carries its own secure-world identity, so the check reads the
+/// same answer; the usual slot is left untouched and never enrolled here.
+pub const RECOVER_SLOT_OFFSET: u32 = 2_000_000;
+
+/// The slot to present `user`'s typed credential to: their usual one, or,
+/// for a recovery, one the overwriting system never used.
+pub fn verify_slot(user: u32, recover: bool) -> u32 {
+    TYPED_SLOT + user + if recover { RECOVER_SLOT_OFFSET } else { 0 }
+}
+
 /// SHA-512 of the parts behind a fixed name for what they are for.
 pub fn personalized_hash(personalization: &[u8], parts: &[&[u8]]) -> Vec<u8> {
     use sha2::{Digest, Sha512};
@@ -429,5 +446,15 @@ mod tests {
     fn a_cost_no_machine_could_pay_is_an_error_rather_than_a_wait() {
         let lock = Lock { kind: Lock::PIN, cost: [64, 3, 1], salt: b"salt".to_vec(), enrolled: Vec::new() };
         assert!(lock.stretched(b"1234").is_err());
+    }
+
+    #[test]
+    fn a_recovery_slot_never_lands_on_a_normal_users_slot() {
+        assert_eq!(verify_slot(0, false), TYPED_SLOT, "the owner's usual slot is the base");
+        assert_ne!(verify_slot(0, true), verify_slot(0, false), "a recovery reads a different slot");
+        // The shift clears the whole range a normal user's slot can reach,
+        // so no recovery check can collide with a user set up normally.
+        let highest_normal = verify_slot(RECOVER_SLOT_OFFSET - 1, false);
+        assert!(highest_normal < verify_slot(0, true));
     }
 }

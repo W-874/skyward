@@ -179,7 +179,7 @@ pub fn open_without_credential(service: &KeyMint) -> Result<Opening> {
         let protector = protector(user)?;
         match protector.lock {
             None => {
-                let note = open_user_files(service, user, None, None)?;
+                let note = open_user_files(service, user, None, None, false)?;
                 if user == OWNER {
                     owner = note;
                 }
@@ -353,13 +353,6 @@ fn protector(user: u32) -> Result<crate::user::Protector> {
     })
 }
 
-/// Which of the secure world's slots a user's enrolments sit in. What the
-/// user types is enrolled a hundred thousand above their own number,
-/// keeping it apart from the enrolments made before phones kept
-/// credentials this way; the secret behind it is enrolled under the
-/// number itself.
-const TYPED_SLOT: u32 = 100_000;
-
 /// What the phone calls the enrolment of a user's own secret, among the
 /// blobs it keeps for that user.
 const BLOBS: &str = "spblob";
@@ -429,7 +422,7 @@ const TAG_BYTES: usize = 16;
 /// none, and a user the phone made one up for needs `owner`, the note the
 /// owner's own secret gave. The owner's files open, their shared storage
 /// shows at /sdcard.
-fn open_user_files(service: &KeyMint, user: u32, credential: Option<&[u8]>, owner: Option<&Token>) -> Result<Note> {
+fn open_user_files(service: &KeyMint, user: u32, credential: Option<&[u8]>, owner: Option<&Token>, recover: bool) -> Result<Note> {
     let protector = protector(user)?;
     let stretched = match &protector.lock {
         Some(lock) => {
@@ -460,7 +453,7 @@ fn open_user_files(service: &KeyMint, user: u32, credential: Option<&[u8]>, owne
         (Bound::Secdiscardable(secdiscardable), Some(lock)) => {
             let (binder, hardware) = (Binder::open()?, Binder::hardware()?);
             let note = Gatekeeper::open(&binder, &hardware)?.verify(
-                TYPED_SLOT + user,
+                crate::user::verify_slot(user, recover),
                 &lock.enrolled,
                 &crate::user::gatekeeper_password(&stretched),
             )?;
