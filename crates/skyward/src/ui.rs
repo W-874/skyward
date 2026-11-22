@@ -2351,8 +2351,16 @@ impl Pages<'_> {
                 show_closed(&mut self.app, &self.closed)?;
             }
             decrypt::Ended::Unlocked(Err(why)) => {
-                skyward_sys::kmsg(&format!("what was entered did not open the user's files: {why}"))?;
-                self.app.unlock_failed(why, now);
+                use skyward_crypto::credential::{rejection, Rejection};
+                skyward_sys::kmsg(&format!("what was entered did not open the user's files: {why:#}"))?;
+                let lang = self.app.state.lang;
+                let message = match rejection(&why) {
+                    Some(Rejection::Incorrect) => lang.pick(["锁屏凭据错误", "鎖定畫面憑證錯誤", "Incorrect credential."]).to_string(),
+                    Some(Rejection::Retry { seconds: Some(n), .. }) if n > 0 => format!("{} {n} {}", lang.pick(["请等待", "請等待", "Retry in"]), lang.pick(["秒后重试", "秒後重試", "seconds."])),
+                    Some(Rejection::Retry { .. }) => lang.pick(["请稍后重试", "請稍後重試", "Try again later."]).to_string(),
+                    None => format!("{why:#}"),
+                };
+                self.app.unlock_failed(message, now);
             }
         }
         // Screenshots taken while internal storage was closed go into
