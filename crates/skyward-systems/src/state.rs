@@ -82,8 +82,33 @@ pub struct System {
     pub own_ramdisk: Option<u64>,
     /// The SHA-256 of the installed system's vendor_boot and dtbo when the
     /// other system was installed, which the other system starts with.
-    pub vendor_boot: String,
-    pub dtbo: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vendor_boot: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dtbo: Option<String>,
+    /// Slot and full partition identity captured at port installation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_port_v1: Option<PortBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortBinding {
+    pub slot: String,
+    pub boot_bytes: u64,
+    pub init_boot_bytes: u64,
+    pub vendor_boot_bytes: u64,
+    pub dtbo_bytes: u64,
+    pub vendor_boot_sha256: String,
+    pub dtbo_sha256: String,
+    pub stock: Written,
+}
+
+impl PortBinding {
+    pub(crate) fn check_saved(&self, saved: &Saved) -> Result<()> {
+        anyhow::ensure!(saved.entry < 2 && saved.boot == self.stock.boot && saved.init_boot == self.stock.init_boot, "the stock backup does not match the installed port binding");
+        Ok(())
+    }
 }
 
 impl System {
@@ -128,7 +153,15 @@ impl State {
     /// The state kept at `path`; none kept is none installed.
     pub fn load(path: &Path) -> Result<State> {
         match fs::read_to_string(path) {
-            Ok(text) => toml::from_str(&text).with_context(|| format!("read {}", path.display())),
+            Ok(text) => {
+                let state: Self = toml::from_str(&text).with_context(|| format!("read {}", path.display()))?;
+                if let Some(system) = &state.system {
+                    // Older recovery requires these legacy fields, so it cannot ignore a port binding.
+                    anyhow::ensure!(matches!((&system.vendor_boot, &system.dtbo, &system.host_port_v1),
+                        (Some(_), Some(_), None) | (None, None, Some(_))), "invalid or mixed host binding in {}", path.display());
+                }
+                Ok(state)
+            }
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(State::default()),
             Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
         }
@@ -182,8 +215,9 @@ pub(crate) mod tests {
                 root: area("/data/skyward/systems/test", 1 << 20),
                 set: Saved { entry: 2, boot: "cc".into(), init_boot: "dd".into() },
                 own_ramdisk: Some(4096),
-                vendor_boot: "ee".into(),
-                dtbo: "ff".into(),
+                vendor_boot: Some("ee".into()),
+                dtbo: Some("ff".into()),
+                host_port_v1: None,
             }),
             occupied: Some("_a".into()),
             written: Some(Written { boot: "cc".into(), init_boot: "11".into() }),

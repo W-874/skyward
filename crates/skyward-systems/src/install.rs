@@ -77,7 +77,7 @@ mod sys {
     use crate::boot::{self, Start};
     use crate::package::{self, Contents, HostDigests, BOOT, INIT_BOOT, ROOT};
     use anyhow::Result;
-    use crate::state::{System, Who, PATH};
+    use crate::state::{PortBinding, Saved, System, Who, PATH};
     use crate::store::{self, OTHER};
     use crate::switch::{self, Places};
     use anyhow::{ensure, Context};
@@ -91,6 +91,11 @@ mod sys {
     use zip::ZipArchive;
 
     const CHUNK: usize = 1 << 20;
+
+    enum VerifiedHost {
+        Legacy(HostDigests),
+        Port(PortBinding),
+    }
 
     fn by_name() -> &'static Path {
         Path::new(BY_NAME)
@@ -240,8 +245,11 @@ mod sys {
     /// from when the other system was installed.
     pub fn changed(state: &State, slot: Slot) -> Result<bool> {
         let Some(system) = &state.system else { return Ok(false) };
-        Ok(sum_of(&store::partition(by_name(), "vendor_boot", slot))? != system.vendor_boot
-            || sum_of(&store::partition(by_name(), "dtbo", slot))? != system.dtbo)
+        if let Some(port) = &system.host_port_v1 {
+            return Ok(port.check_target(by_name(), slot).and_then(|()| port.check_shared(by_name(), slot)).is_err());
+        }
+        Ok(Some(sum_of(&store::partition(by_name(), "vendor_boot", slot))?) != system.vendor_boot
+            || Some(sum_of(&store::partition(by_name(), "dtbo", slot))?) != system.dtbo)
     }
 
     /// Install the package whose contents the installer offered to the user.
@@ -250,26 +258,32 @@ mod sys {
     pub fn install<R: Read + Seek>(zip: &mut ZipArchive<R>, contents: &Contents, size: u64, program: &[u8], progress: &mut dyn FnMut(Step)) -> Result<()> {
         let actual = package::read(zip)?;
         ensure!(actual == *contents, "the package contents changed before installation");
-        // Use the slot booted by recovery, not the next active slot or
-        // anything specified by the package. Check before changing mounts,
-        // allocating areas, mapping devices, writing images or saving state.
+        // Legacy digests still name the booted slot. Port mode additionally
+        // requires that the bootloader's next slot is the bound slot.
         let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
-        let host = actual.manifest.check_host(
-            || {
-                let config = Path::new("/").join(skyward_config::ramdisk::CONFIG);
-                let text = fs::read_to_string(&config).with_context(|| format!("read {}", config.display()))?;
-                skyward_config::codename(&text)
-            },
-            |name| sum_of(&store::partition(by_name(), name, slot)),
-        )?;
+        let device = || {
+            let config = Path::new("/").join(skyward_config::ramdisk::CONFIG);
+            let text = fs::read_to_string(&config).with_context(|| format!("read {}", config.display()))?;
+            skyward_config::codename(&text)
+        };
+        let host = if actual.manifest.host_port_v1.is_some() {
+            ensure!(skyward_vab::snapshot_state()? == skyward_vab::SnapshotState::None, "cannot bind a port while an Android update is in flight");
+            let next = skyward_vab::boot::next_slot()?;
+            VerifiedHost::Port(actual.manifest.bind_port(by_name(), &device()?, slot, next)?)
+        } else {
+            VerifiedHost::Legacy(actual.manifest.check_host(device, |name| sum_of(&store::partition(by_name(), name, slot)))?)
+        };
         writable(|| install_now(zip, &actual, size, program, slot, host, progress))
     }
 
-    fn install_now<R: Read + Seek>(zip: &mut ZipArchive<R>, contents: &Contents, size: u64, program: &[u8], slot: Slot, host: HostDigests, progress: &mut dyn FnMut(Step)) -> Result<()> {
+    fn install_now<R: Read + Seek>(zip: &mut ZipArchive<R>, contents: &Contents, size: u64, program: &[u8], slot: Slot, host: VerifiedHost, progress: &mut dyn FnMut(Step)) -> Result<()> {
         let path = Path::new(PATH);
         let mut state = State::load(path)?;
         ensure!(state.switching.is_none(), "a switch begun before is not done yet");
         ensure!(state.system.is_none(), "another system is installed already");
+        if let (VerifiedHost::Port(port), Some(store)) = (&host, &state.store) {
+            port.check_store(store)?;
+        }
         ensure!(size >= contents.least(), "a root of {size} bytes is less than the {} the system takes", contents.least());
         let room = room_now(slot)?;
         ensure!(size <= room, "the data partition has room for {room} bytes, less than {size}");
@@ -281,10 +295,25 @@ mod sys {
             state.store = Some(Store { area, boot, init_boot });
             state.save(path)?;
         }
+        let port_backup = if let VerifiedHost::Port(port) = &host {
+            let store = state.store.as_ref().context("no store for port backup")?;
+            port.check_store(store)?;
+            port.check_target(by_name(), slot)?;
+            let entry = Store::next_save(state.saved.as_ref());
+            Some(with_store(&state, |device| {
+                store::check_capacity(device, store.area.size)?;
+                let saved = store::save(store, device, entry, by_name(), slot).context("save and read back the complete stock pair")?;
+                port.check_saved(&saved)?;
+                let template = store::init_boot(store, device, &saved)?;
+                Ok((saved, template))
+            })?)
+        } else {
+            None
+        };
         let id = contents.manifest.id.clone();
         let file = folder.join(format!("{id}.img"));
         let root = area::create(&file, size + HEADER, &mut |done, total| progress(Step::Allocating { done, total }))?;
-        let made = (|| -> Result<System> {
+        let made = (|| -> Result<(System, Option<Saved>)> {
             write_root(zip, &root, contents.root, progress)?;
             progress(Step::Finishing);
             let start = Start { id: id.clone(), filesystem: contents.manifest.filesystem.clone(), init: contents.manifest.init.clone(), root: root.clone() };
@@ -295,6 +324,10 @@ mod sys {
                     let (image, own_ramdisk) = boot::with_start(&own, program, &start)?;
                     (image, Some(own_ramdisk))
                 }
+                false if port_backup.is_some() => {
+                    let (_, template) = port_backup.as_ref().context("no verified port init_boot template")?;
+                    (boot::init_boot(template, program, &start)?, None)
+                }
                 false => (boot::init_boot(&fs::read(store::partition(by_name(), store::INIT_BOOT, slot)).context("read the phone's init_boot")?, program, &start)?, None),
             };
             let set = with_store(&state, |device| {
@@ -302,7 +335,26 @@ mod sys {
                 let store = state.store.as_ref().expect("made above");
                 store::put(store, device, OTHER, &mut image, contents.boot, &init_boot)
             })?;
-            Ok(System {
+            let (vendor_boot, dtbo, host_port_v1, saved) = match host {
+                VerifiedHost::Legacy(host) => {
+                    let sum = |known: Option<String>, name| -> Result<Option<String>> {
+                        Ok(Some(match known {
+                            Some(sum) => sum,
+                            None => sum_of(&store::partition(by_name(), name, slot))?,
+                        }))
+                    };
+                    (sum(host.vendor_boot, "vendor_boot")?, sum(host.dtbo, "dtbo")?, None, None)
+                }
+                VerifiedHost::Port(port) => {
+                    let (saved, _) = port_backup.context("no verified stock backup")?;
+                    ensure!(skyward_vab::snapshot_state()? == skyward_vab::SnapshotState::None, "an Android update began during port installation");
+                    ensure!(skyward_vab::boot::next_slot()? == slot, "active slot changed during port installation");
+                    port.check_shared(by_name(), slot)?;
+                    port.check_stock(state.store.as_ref().context("no store for port backup")?, by_name(), slot)?;
+                    (None, None, Some(port), Some(saved))
+                }
+            };
+            Ok((System {
                 id: id.clone(),
                 name: contents.manifest.name.clone(),
                 version: contents.manifest.version.clone(),
@@ -311,18 +363,16 @@ mod sys {
                 root: root.clone(),
                 set,
                 own_ramdisk,
-                vendor_boot: match host.vendor_boot {
-                    Some(sum) => sum,
-                    None => sum_of(&store::partition(by_name(), "vendor_boot", slot))?,
-                },
-                dtbo: match host.dtbo {
-                    Some(sum) => sum,
-                    None => sum_of(&store::partition(by_name(), "dtbo", slot))?,
-                },
-            })
+                vendor_boot,
+                dtbo,
+                host_port_v1,
+            }, saved))
         })();
         match made {
-            Ok(system) => {
+            Ok((system, saved)) => {
+                if saved.is_some() {
+                    state.saved = saved;
+                }
                 state.system = Some(system);
                 state.save(path)
             }

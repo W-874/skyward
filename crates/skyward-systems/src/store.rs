@@ -83,6 +83,80 @@ fn open(path: &Path, write: bool) -> Result<File> {
     OpenOptions::new().read(true).write(write).open(path).with_context(|| format!("open {}", path.display()))
 }
 
+/// A port credential names an exact partition range, not merely a readable prefix.
+pub(crate) fn check_capacity(path: &Path, expected: u64) -> Result<()> {
+    #[cfg(target_os = "android")]
+    let capacity = skyward_block::size_bytes(path);
+    #[cfg(not(target_os = "android"))]
+    let capacity = std::fs::metadata(path).map(|m| m.len());
+    let actual = capacity.with_context(|| format!("read capacity of {}", path.display()))?;
+    ensure!(actual == expected, "{} capacity mismatch: expected {expected} bytes, found {actual}", path.display());
+    Ok(())
+}
+
+pub(crate) fn partition_sum(path: &Path, bytes: u64) -> Result<String> {
+    check_capacity(path, bytes)?;
+    sum(&mut open(path, false)?, 0, bytes).with_context(|| format!("hash {}", path.display()))
+}
+
+impl crate::state::PortBinding {
+    pub(crate) fn check_store(&self, store: &Store) -> Result<()> {
+        let bytes = self.boot_bytes.checked_add(self.init_boot_bytes)
+            .and_then(|n| n.checked_mul(ENTRIES)).and_then(|n| n.checked_add(HEADER));
+        ensure!(self.boot_bytes > 0 && self.init_boot_bytes > 0 && store.boot == self.boot_bytes
+            && store.init_boot == self.init_boot_bytes && bytes.is_some_and(|n| n <= store.area.size), "the store does not cover the bound boot partitions");
+        Ok(())
+    }
+
+    pub(crate) fn check_target(&self, dir: &Path, slot: Slot) -> Result<()> {
+        ensure!(slot.suffix() == self.slot, "the port binding requires slot {}, not {}", self.slot, slot.suffix());
+        check_capacity(&partition(dir, BOOT, slot), self.boot_bytes)?;
+        check_capacity(&partition(dir, INIT_BOOT, slot), self.init_boot_bytes)
+    }
+
+    pub(crate) fn check_shared(&self, dir: &Path, slot: Slot) -> Result<()> {
+        for (name, bytes, expected) in [
+            ("vendor_boot", self.vendor_boot_bytes, &self.vendor_boot_sha256),
+            ("dtbo", self.dtbo_bytes, &self.dtbo_sha256),
+        ] {
+            ensure!(partition_sum(&partition(dir, name, slot), bytes)? == *expected, "bound host {name} SHA-256 changed");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check_stock(&self, store: &Store, dir: &Path, slot: Slot) -> Result<()> {
+        self.check_target(dir, slot)?;
+        ensure!(held(store, dir, slot)? == self.stock, "bound host boot or init_boot full-partition SHA-256 changed");
+        Ok(())
+    }
+}
+
+/// Hash all the advertised prefix lengths and the full boot in the same read.
+#[cfg(any(target_os = "android", test))]
+pub(crate) fn bind_boot(path: &Path, bytes: u64, prefixes: &[crate::package::BootPrefix]) -> Result<String> {
+    check_capacity(path, bytes)?;
+    let mut candidates: Vec<_> = prefixes.iter().collect();
+    candidates.sort_unstable_by_key(|p| p.bytes);
+    let mut f = open(path, false)?;
+    skyward_block::drop_cache(&f)?;
+    let (mut h, mut at, mut matched) = (Sha256::new(), 0, false);
+    let mut buf = vec![0; CHUNK];
+    for (end, prefix) in candidates.into_iter().map(|p| (p.bytes, Some(p))).chain([(bytes, None)]) {
+        while at < end {
+            let n = (end - at).min(CHUNK as u64) as usize;
+            f.read_exact(&mut buf[..n]).with_context(|| format!("read {} at {at}", path.display()))?;
+            h.update(&buf[..n]);
+            at += n as u64;
+        }
+        if let Some(p) = prefix {
+            matched |= hex::encode(h.clone().finalize()).eq_ignore_ascii_case(&p.sha256);
+        } else {
+            ensure!(matched, "{} does not match any authorised boot prefix", path.display());
+        }
+    }
+    Ok(hex::encode(h.finalize()))
+}
+
 /// The partitions of `slot` a boot set fills, by name, with the bytes each
 /// holds and where in an entry it goes.
 fn parts(store: &Store, dir: &Path, slot: Slot) -> Vec<(&'static str, PathBuf, u64, u64)> {

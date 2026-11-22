@@ -38,6 +38,29 @@ pub struct Manifest {
     pub host_vendor_boot_sha256: Option<String>,
     /// Hex SHA-256 of the entire host dtbo partition in that slot.
     pub host_dtbo_sha256: Option<String>,
+    /// Explicit port binding; never mixed with the legacy whole-digest fields.
+    pub host_port_v1: Option<HostPortV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostPortV1 {
+    pub slot: String,
+    pub boot_bytes: u64,
+    pub init_boot_bytes: u64,
+    pub init_boot_sha256: String,
+    pub vendor_boot_bytes: u64,
+    pub vendor_boot_sha256: String,
+    pub dtbo_bytes: u64,
+    pub dtbo_sha256: String,
+    pub boot_prefixes: Vec<BootPrefix>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BootPrefix {
+    pub bytes: u64,
+    pub sha256: String,
 }
 
 fn default_init() -> String {
@@ -56,6 +79,7 @@ pub(crate) struct HostDigests {
 impl Manifest {
     /// Read and check only the host identity and partitions the package binds.
     pub(crate) fn check_host(&self, device: impl FnOnce() -> Result<String>, mut sum: impl FnMut(&str) -> Result<String>) -> Result<HostDigests> {
+        ensure!(self.host_port_v1.is_none(), "a port-bound package requires the port verifier");
         if let Some(expected) = &self.device {
             let actual = device().context("read the recovery device codename for package binding")?;
             ensure!(actual == *expected, "the package requires device {expected:?}, but this recovery is for {actual:?}");
@@ -71,6 +95,27 @@ impl Manifest {
             vendor_boot: check("vendor_boot", "host_vendor_boot_sha256", self.host_vendor_boot_sha256.as_deref())?,
             dtbo: check("dtbo", "host_dtbo_sha256", self.host_dtbo_sha256.as_deref())?,
         })
+    }
+
+    pub(crate) fn bind_port(&self, by_name: &std::path::Path, device: &str, current: skyward_vab::Slot, next: skyward_vab::Slot) -> Result<crate::state::PortBinding> {
+        use crate::{state::{PortBinding, Written}, store};
+        check(self)?;
+        let p = self.host_port_v1.as_ref().context("missing host_port_v1")?;
+        ensure!(self.device.as_deref() == Some(device), "host_port_v1 device mismatch: package requires {:?}, recovery is {device}", self.device);
+        ensure!(p.slot == current.suffix() && current == next, "host_port_v1 requires slot {} to be both booted and active (booted {}, active {})", p.slot, current.suffix(), next.suffix());
+        let part = |name| store::partition(by_name, name, current);
+        let verified = |name, len, expected: &str| -> Result<String> {
+            let actual = store::partition_sum(&part(name), len)?;
+            ensure!(actual.eq_ignore_ascii_case(expected), "host_port_v1 {name} SHA-256 mismatch: expected {expected}, found {actual}");
+            Ok(actual)
+        };
+        let init_boot = verified(store::INIT_BOOT, p.init_boot_bytes, &p.init_boot_sha256)?;
+        let vendor_boot_sha256 = verified("vendor_boot", p.vendor_boot_bytes, &p.vendor_boot_sha256)?;
+        let dtbo_sha256 = verified("dtbo", p.dtbo_bytes, &p.dtbo_sha256)?;
+        let boot = store::bind_boot(&part(store::BOOT), p.boot_bytes, &p.boot_prefixes)?;
+        Ok(PortBinding { slot: p.slot.clone(), boot_bytes: p.boot_bytes, init_boot_bytes: p.init_boot_bytes,
+            vendor_boot_bytes: p.vendor_boot_bytes, dtbo_bytes: p.dtbo_bytes, vendor_boot_sha256, dtbo_sha256,
+            stock: Written { boot, init_boot } })
     }
 }
 
@@ -110,7 +155,12 @@ pub fn read<R: Read + Seek>(zip: &mut ZipArchive<R>) -> Result<Contents> {
     let boot = size(zip, BOOT)?;
     let root = size(zip, ROOT)?;
     ensure!(boot > 0 && root > 0, "the package's boot or root image is empty");
-    Ok(Contents { manifest, boot, root, init_boot: zip.index_for_name(INIT_BOOT).is_some() })
+    let init_boot = zip.index_for_name(INIT_BOOT).is_some();
+    if let Some(port) = &manifest.host_port_v1 {
+        ensure!(boot <= port.boot_bytes, "the guest boot image exceeds the bound boot partition");
+        ensure!(!init_boot, "port-bound packages must use Skyward-generated init_boot");
+    }
+    Ok(Contents { manifest, boot, root, init_boot })
 }
 
 fn check(m: &Manifest) -> Result<()> {
@@ -132,6 +182,19 @@ fn check(m: &Manifest) -> Result<()> {
         if let Some(digest) = digest {
             ensure!(digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()), "{field} must be a 64-digit hexadecimal SHA-256");
         }
+    }
+    if let Some(port) = &m.host_port_v1 {
+        ensure!(m.device.is_some(), "host_port_v1 requires device");
+        ensure!(m.host_boot_sha256.is_none() && m.host_vendor_boot_sha256.is_none() && m.host_dtbo_sha256.is_none(), "host_port_v1 cannot be mixed with strict host digest fields");
+        ensure!(matches!(port.slot.as_str(), "_a" | "_b"), "host_port_v1.slot must be _a or _b");
+        ensure!([port.boot_bytes, port.init_boot_bytes, port.vendor_boot_bytes, port.dtbo_bytes].into_iter().all(|n| n != 0 && n % 512 == 0), "host_port_v1 requires positive sector-aligned partition capacities");
+        ensure!(port.boot_bytes.checked_add(port.init_boot_bytes).and_then(|n| n.checked_mul(3)).and_then(|n| n.checked_add(skyward_block::area::HEADER)).is_some_and(|n| n <= i64::MAX as u64), "host_port_v1 store geometry overflows");
+        ensure!(!port.boot_prefixes.is_empty() && port.boot_prefixes.len() <= 32, "host_port_v1 requires 1 to 32 boot prefix candidates");
+        for (i, prefix) in port.boot_prefixes.iter().enumerate() {
+            ensure!(prefix.bytes != 0 && prefix.bytes <= port.boot_bytes, "boot prefix length is outside the bound partition");
+            ensure!(!port.boot_prefixes[..i].iter().any(|p| p.bytes == prefix.bytes && p.sha256.eq_ignore_ascii_case(&prefix.sha256)), "duplicate boot prefix candidate");
+        }
+        ensure!([&port.init_boot_sha256, &port.vendor_boot_sha256, &port.dtbo_sha256].into_iter().chain(port.boot_prefixes.iter().map(|p| &p.sha256)).all(|sha| sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit())), "host_port_v1 digests must be 64-digit hexadecimal SHA-256");
     }
     Ok(())
 }

@@ -38,13 +38,32 @@ pub fn switch(places: &Places, next: Slot, to: Who) -> Result<()> {
         (Who::Installed, Some(s)) => s.clone(),
         (Who::Installed, None) => bail!("the installed system's boot set is in the partitions already"),
     };
+    let bound = state.system.as_ref().and_then(|system| system.host_port_v1.as_ref());
+    if let Some(port) = bound {
+        let target = Slot::from_suffix(&slot).context("invalid port target slot")?;
+        let store = state.store.as_ref().context("no store holds the boot sets")?;
+        port.check_store(store)?;
+        store::check_capacity(places.store, store.area.size)?;
+        port.check_target(places.by_name, target)?;
+        if to == Who::Other {
+            port.check_shared(places.by_name, target)?;
+            port.check_stock(store, places.by_name, target)?;
+        }
+        let saved = state.saved.as_ref().context("no verified stock backup")?;
+        port.check_saved(saved)?;
+        store::check(store, places.store, saved)?;
+    }
     // Made before the switch begins, so that a switch begun is one that
     // can be finished.
     let init_boot = match to {
         Who::Other => Some(other_init_boot(places, &state)?),
         Who::Installed => None,
     };
-    state.switching = Some(Switching { to, slot, saved: false });
+    if let (Some(_), Some(image)) = (bound, init_boot.as_ref()) {
+        let store = state.store.as_ref().context("no store holds the boot sets")?;
+        ensure!(image.len() as u64 <= store.init_boot, "the generated guest init_boot exceeds the bound partition");
+    }
+    state.switching = Some(Switching { to, slot, saved: bound.is_some() });
     state.save(places.state)?;
     finish(places, &mut state, init_boot)
 }
@@ -76,6 +95,33 @@ fn finish(places: &Places, state: &mut State, init_boot: Option<Vec<u8>>) -> Res
     let switching = state.switching.clone().context("no switch to finish")?;
     let slot = Slot::from_suffix(&switching.slot).with_context(|| format!("the switch is to slot {:?}", switching.slot))?;
     let store = state.store.clone().context("no store holds the boot sets")?;
+    if let Some(port) = state.system.as_ref().and_then(|system| system.host_port_v1.as_ref()) {
+        port.check_store(&store)?;
+        store::check_capacity(places.store, store.area.size)?;
+        port.check_target(places.by_name, slot)?;
+        ensure!(switching.saved, "the port switch has no committed stock backup");
+        let saved = state.saved.as_ref().context("no verified stock backup")?;
+        port.check_saved(saved)?;
+        store::check(&store, places.store, saved)?;
+        if switching.to == Who::Other && init_boot.is_none() {
+            // The pair may be partially overwritten. Never recapture it as stock.
+            let recheck = || -> Result<()> {
+                #[cfg(target_os = "android")]
+                {
+                    ensure!(skyward_vab::boot::next_slot()? == slot, "active slot changed during the port switch");
+                    ensure!(skyward_vab::snapshot_state()? == skyward_vab::SnapshotState::None, "an Android update is in flight");
+                }
+                port.check_shared(places.by_name, slot)
+            };
+            if let Err(e) = recheck() {
+                // Journal the change of direction before the first restore write.
+                state.switching = Some(Switching { to: Who::Installed, ..switching });
+                state.save(places.state)?;
+                finish(places, state, None).context("restore stock after port host inputs changed")?;
+                return Err(e.context("port switch cancelled; verified stock boot pair restored"));
+            }
+        }
+    }
     let init_boot = match (switching.to, init_boot) {
         (Who::Other, Some(made)) => Some(made),
         (Who::Other, None) => Some(other_init_boot(places, state)?),
@@ -212,8 +258,9 @@ mod tests {
                 root: area("/data/skyward/systems/test", 1 << 20),
                 set,
                 own_ramdisk: None,
-                vendor_boot: String::new(),
-                dtbo: String::new(),
+                vendor_boot: Some(String::new()),
+                dtbo: Some(String::new()),
+                host_port_v1: None,
             }),
             ..State::default()
         };
@@ -222,6 +269,141 @@ mod tests {
         let program = path.join("system-init");
         std::fs::write(&program, b"new program").unwrap();
         Bench { _dir: dir, dir: path, state: state_path, store: device, program }
+    }
+
+    fn port_fixture(b: &Bench) -> crate::package::Manifest {
+        use crate::package::{self, tests::{zip, MANIFEST_TEXT}};
+        use sha2::{Digest, Sha256};
+        let sum = |bytes: &[u8]| hex::encode(Sha256::digest(bytes));
+        fs::write(b.dir.join("vendor_boot_a"), [0x31; 4096]).unwrap();
+        fs::write(b.dir.join("dtbo_a"), [0x47; 512]).unwrap();
+        let mut boot = b.read("boot_a");
+        boot[4096..].fill(0x67);
+        fs::write(b.dir.join("boot_a"), &boot).unwrap();
+        let text = format!("{}device='fuxi'\n[host_port_v1]\nslot='_a'\nboot_bytes=8192\ninit_boot_bytes=16384\ninit_boot_sha256='{}'\nvendor_boot_bytes=4096\nvendor_boot_sha256='{}'\ndtbo_bytes=512\ndtbo_sha256='{}'\n[[host_port_v1.boot_prefixes]]\nbytes=4096\nsha256='{}'\n[[host_port_v1.boot_prefixes]]\nbytes=4096\nsha256='{}'\n",
+            std::str::from_utf8(MANIFEST_TEXT).unwrap(), sum(&b.read("init_boot_a")), sum(&b.read("vendor_boot_a")), sum(&b.read("dtbo_a")), sum(&[0xfe; 4096]), sum(&boot[..4096]));
+        let parse = |text: &str, boot: &[u8], own: bool| {
+            let mut files = vec![(package::MANIFEST, text.as_bytes()), (package::BOOT, boot), (package::ROOT, &b"root"[..])];
+            if own { files.push((package::INIT_BOOT, b"init")); }
+            package::read(&mut zip::ZipArchive::new(std::io::Cursor::new(zip(&files))).unwrap())
+        };
+        assert!(parse(&format!("host_boot_sha256='{}'\n{text}", "a1".repeat(32)), b"guest boot", false).is_err());
+        assert!(parse(&text.replace("bytes=4096\nsha256", "bytes=8193\nsha256"), b"guest boot", false).is_err());
+        assert!(parse(&text.replace("init_boot_bytes=16384\n", ""), b"guest boot", false).is_err());
+        assert!(parse(&text, &[0; 8193], false).is_err());
+        assert!(parse(&text, b"guest boot", true).is_err());
+        parse(&text, b"guest boot", false).unwrap().manifest
+    }
+
+    fn bind_fixture(b: &Bench) -> State {
+        let manifest = port_fixture(b);
+        let binding = manifest.bind_port(&b.dir, "fuxi", Slot::A, Slot::A).unwrap();
+        let mut state = State::load(&b.state).unwrap();
+        let store = state.store.as_ref().unwrap();
+        binding.check_store(store).unwrap();
+        let saved = store::save(store, &b.store, 0, &b.dir, Slot::A).unwrap();
+        binding.check_saved(&saved).unwrap();
+        state.saved = Some(saved);
+        let system = state.system.as_mut().unwrap();
+        (system.vendor_boot, system.dtbo, system.host_port_v1) = (None, None, Some(binding));
+        state.save(&b.state).unwrap();
+        state
+    }
+
+    #[test]
+    fn port_bound_input_rejects_wrong_device_slot_prefix_and_unverified_full_ranges() {
+        let b = installed();
+        let m = port_fixture(&b);
+        let bind = || m.bind_port(&b.dir, "fuxi", Slot::A, Slot::A);
+        assert!(bind().is_ok());
+        assert!(m.check_host(|| panic!("legacy fallback"), |_| panic!("legacy fallback")).is_err());
+        assert!(m.bind_port(&b.dir, "dada", Slot::A, Slot::A).is_err());
+        assert!(m.bind_port(&b.dir, "fuxi", Slot::A, Slot::B).is_err());
+        assert!(m.bind_port(&b.dir, "fuxi", Slot::B, Slot::B).is_err());
+        for name in ["boot_a", "init_boot_a", "vendor_boot_a", "dtbo_a"] {
+            let path = b.dir.join(name);
+            let mut changed = b.read(name);
+            let original = changed.clone();
+            changed[0] ^= 1;
+            fs::write(&path, &changed).unwrap();
+            assert!(bind().is_err(), "changed {name}");
+            fs::write(&path, &original[..original.len() - 1]).unwrap();
+            assert!(bind().is_err(), "short {name}");
+            fs::write(&path, original).unwrap();
+        }
+    }
+
+    #[test]
+    fn port_bound_switch_rechecks_full_stock_and_restores_its_nonzero_tail() {
+        let b = installed();
+        let state = bind_fixture(&b);
+        let places = b.places();
+        let (stock, init, control) = (b.read("boot_a"), b.read("init_boot_a"), b.read("boot_b"));
+        assert!(switch(&places, Slot::B, Who::Other).is_err());
+        let mut changed = stock.clone();
+        changed[8191] ^= 1;
+        fs::write(b.dir.join("boot_a"), &changed).unwrap();
+        assert!(switch(&places, Slot::A, Who::Other).is_err());
+        assert_eq!(b.read("boot_a"), changed);
+        assert_eq!(State::load(&b.state).unwrap(), state);
+        fs::write(b.dir.join("boot_a"), &stock).unwrap();
+        switch(&places, Slot::A, Who::Other).unwrap();
+        assert_eq!(b.program_in("init_boot_a"), b"new program");
+        switch(&places, Slot::B, Who::Installed).unwrap();
+        assert_eq!((b.read("boot_a"), b.read("init_boot_a"), b.read("boot_b")), (stock.clone(), init, control));
+        fs::write(b.dir.join("boot_a"), &changed).unwrap();
+        assert!(switch(&places, Slot::A, Who::Other).is_err(), "later switch must still use the original binding");
+        assert!(!resume(&places).unwrap());
+    }
+
+    #[test]
+    fn port_bound_resume_never_recaptures_partial_partitions_and_fails_closed() {
+        for (to, changed_shared) in [(Who::Other, false), (Who::Installed, false), (Who::Other, true)] {
+            let b = installed();
+            let mut state = bind_fixture(&b);
+            let places = b.places();
+            let stock = (b.read("boot_a"), b.read("init_boot_a"));
+            state.switching = Some(Switching { to, slot: "_a".into(), saved: true });
+            state.save(&b.state).unwrap();
+            fs::write(b.dir.join("boot_a"), [0xe1; 8192]).unwrap();
+            fs::write(b.dir.join("init_boot_a"), [0xe2; 16384]).unwrap();
+            // Corrupt the stock backup: no write to either partition and the journal survives.
+            let good = fs::read(&b.store).unwrap();
+            let mut bad = good.clone();
+            bad[skyward_block::area::HEADER as usize] ^= 1;
+            fs::write(&b.store, bad).unwrap();
+            assert!(resume(&places).is_err());
+            assert_eq!(b.read("boot_a"), [0xe1; 8192]);
+            assert_eq!(b.read("init_boot_a"), [0xe2; 16384]);
+            assert_eq!(State::load(&b.state).unwrap(), state);
+            fs::write(&b.store, good).unwrap();
+            if changed_shared { fs::write(b.dir.join("dtbo_a"), [0xf3; 512]).unwrap(); }
+            assert_eq!(resume(&places).is_err(), changed_shared);
+            if to == Who::Other && !changed_shared {
+                switch(&places, Slot::B, Who::Installed).unwrap();
+            }
+            assert_eq!((b.read("boot_a"), b.read("init_boot_a")), stock);
+            assert_eq!(State::load(&b.state).unwrap().saved, state.saved);
+            assert!(!resume(&places).unwrap());
+        }
+    }
+
+    #[test]
+    fn port_bound_switch_with_no_backup_or_changed_capacity_does_not_start() {
+        let b = installed();
+        let mut state = bind_fixture(&b);
+        let places = b.places();
+        let saved = state.saved.take();
+        state.save(&b.state).unwrap();
+        assert!(switch(&places, Slot::A, Who::Other).unwrap_err().to_string().contains("backup"));
+        state.saved = saved;
+        state.save(&b.state).unwrap();
+        let mut larger = b.read("boot_a");
+        larger.push(0);
+        fs::write(b.dir.join("boot_a"), &larger).unwrap();
+        assert!(switch(&places, Slot::A, Who::Other).unwrap_err().to_string().contains("capacity mismatch"));
+        assert_eq!(b.read("boot_a"), larger);
+        assert_eq!(State::load(&b.state).unwrap(), state);
     }
 
     // Based on the user's existing (uncommitted) dada_stock_pair_survives_interrupted_switch_on_files
@@ -233,6 +415,7 @@ mod tests {
                 (100663296, "7407f44c6afde05384a543c3b47bab50daa83c3e242dcbe0b4a7a6db17a89052"),
                 (8388608, "65d39f7af0b3a9f6989e08b5dafcedcd393143b8db202a19e6e902c04b8af56c"),
             ],
+            None,
         );
     }
 
@@ -243,10 +426,28 @@ mod tests {
                 (100663296, "d973cf1324147d9411feea07ab070aec11fb2ec2c1bb5ef7a512b42bd44c8859"),
                 (8388608, "236072ac4c1c8f21506c59c1717dc232972912e538fdd82ee4c76c53f86ba10e"),
             ],
+            None,
         );
     }
 
-    fn stock_pair_survives_interrupted_switch_on_files(fixture: &str, version: &str, pinned: [(usize, &str); 2]) {
+    #[test]
+    fn fuxi_gpt_stock_pair_survives_interrupted_switch_on_files() {
+        // .309 fastboot gpt_main4.bin gives both slots a 192 MiB boot and an 8 MiB init_boot.
+        stock_pair_survives_interrupted_switch_on_files(
+            "fuxi/os3-packaging", "OS3.0.309.0.WMCCNXM GPT fixture", [
+                (100663296, "d973cf1324147d9411feea07ab070aec11fb2ec2c1bb5ef7a512b42bd44c8859"),
+                (8388608, "236072ac4c1c8f21506c59c1717dc232972912e538fdd82ee4c76c53f86ba10e"),
+            ],
+            Some([201326592, 8388608]),
+        );
+    }
+
+    fn stock_pair_survives_interrupted_switch_on_files(
+        fixture: &str,
+        version: &str,
+        pinned: [(usize, &str); 2],
+        gpt_sizes: Option<[usize; 2]>,
+    ) {
         use sha2::{Digest, Sha256};
 
         let root = std::env::var_os("SKYWARD_STOCK_BASELINE").map(PathBuf::from)
@@ -259,36 +460,71 @@ mod tests {
             assert_eq!(sha, hex::encode(Sha256::digest(&image)), "wrong {part} bytes for {version}");
             image
         };
-        let [stock_boot, stock_init] = [read("boot", pinned[0]), read("init_boot", pinned[1])];
+        let [mut stock_boot, stock_init] = [read("boot", pinned[0]), read("init_boot", pinned[1])];
+        let boot_image_len = stock_boot.len();
+        if let Some([boot, init_boot]) = gpt_sizes {
+            assert_eq!(init_boot, stock_init.len());
+            assert!(boot > boot_image_len + 4096);
+            // A varying, entirely nonzero suffix models unknown partition bytes; it is not OEM data.
+            stock_boot.reserve_exact(boot - boot_image_len);
+            stock_boot.extend((1u8..=251).cycle().take(boot - boot_image_len));
+            assert_eq!(stock_boot.len(), boot);
+            assert_eq!(crate::state::Store::size_for(boot as u64, init_boot as u64), 629149696);
+        }
+        let full_boot_sha = hex::encode(Sha256::digest(&stock_boot));
+        let control = [("boot_b", stock_boot.len(), 0xb1), ("init_boot_b", stock_init.len(), 0xb2)];
+        if gpt_sizes.is_some() {
+            println!("{version}: boot_a={} B SHA-256={full_boot_sha}; init_boot_a={} B SHA-256={}",
+                stock_boot.len(), stock_init.len(), pinned[1].1);
+        }
 
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         enum Cut {
-            Begun, SavingBoot, SavedBoot, SavingInit, SavedPair, SaveRecorded,
-            WritingBoot, WroteBoot, WritingInit, WrotePair, Committed,
+            Begun, SavingBoot, SavingBootTail, SavedBoot, SavingInit, SavedPair, SaveRecorded,
+            WritingBoot, WritingBootTail, WroteBoot, WritingInit, WrotePair, Committed,
         }
         use Cut::*;
 
         let mut guest_boot = vec![0; stock_boot.len()];
-        guest_boot[..8192].fill(0x5a);
+        let guest_boot_len = if gpt_sizes.is_some() {
+            // The guest supplies the OTA image, not the full installed boot partition.
+            guest_boot[..boot_image_len].copy_from_slice(&stock_boot[..boot_image_len]);
+            boot_image_len
+        } else {
+            guest_boot[..8192].fill(0x5a);
+            8192
+        };
         // A Skyward-shaped guest with an older program, as in the original local test.
         let guest_template = crate::boot::init_boot(&stock_init, b"test program", &start()).unwrap();
         for (to, cuts) in [
-            (Who::Other, &[Begun, SavingBoot, SavedBoot, SavingInit, SavedPair, SaveRecorded, WritingBoot, WroteBoot, WritingInit, WrotePair, Committed][..]),
-            (Who::Installed, &[Begun, WritingBoot, WroteBoot, WritingInit, WrotePair, Committed][..]),
+            (Who::Other, &[Begun, SavingBoot, SavingBootTail, SavedBoot, SavingInit, SavedPair, SaveRecorded, WritingBoot, WritingBootTail, WroteBoot, WritingInit, WrotePair, Committed][..]),
+            (Who::Installed, &[Begun, WritingBoot, WritingBootTail, WroteBoot, WritingInit, WrotePair, Committed][..]),
         ] {
             for &cut in cuts {
+                if gpt_sizes.is_none() && matches!(cut, SavingBootTail | WritingBootTail) {
+                    continue;
+                }
                 let b = installed();
                 let mut s = State::load(&b.state).unwrap();
                 let mut store = s.store.take().unwrap();
                 fs::write(b.dir.join("boot_a"), &stock_boot).unwrap();
                 fs::write(b.dir.join("init_boot_a"), &stock_init).unwrap();
+                if gpt_sizes.is_some() {
+                    for (name, len, fill) in control {
+                        let mut file = fs::File::create(b.dir.join(name)).unwrap();
+                        std::io::copy(&mut std::io::Read::take(std::io::repeat(fill), len as u64), &mut file).unwrap();
+                        file.sync_all().unwrap();
+                    }
+                }
                 store.boot = stock_boot.len() as u64;
                 store.init_boot = stock_init.len() as u64;
                 store.area.size = crate::state::Store::size_for(store.boot, store.init_boot);
                 fs::File::create(&b.store).unwrap().set_len(store.area.size).unwrap();
-                s.system.as_mut().unwrap().set = put(&store, &b.store, OTHER, &mut &guest_boot[..8192], 8192, &guest_template).unwrap();
+                s.system.as_mut().unwrap().set = put(&store, &b.store, OTHER, &mut &guest_boot[..guest_boot_len], guest_boot_len as u64, &guest_template).unwrap();
                 // Keep a previous complete save while the next one is interrupted.
-                let old_save = store::save(&store, &b.store, 0, &b.dir, Slot::A).unwrap();
+                // In the GPT fixture the previous save is from the distinct control slot.
+                let previous = if gpt_sizes.is_some() { Slot::B } else { Slot::A };
+                let old_save = store::save(&store, &b.store, 0, &b.dir, previous).unwrap();
                 s.saved = Some(old_save.clone());
                 s.store = Some(store.clone());
                 s.save(&b.state).unwrap();
@@ -308,21 +544,26 @@ mod tests {
                 }
                 let target = if to == Who::Other { (&guest_boot, &guest_init) } else { (&stock_boot, &stock_init) };
                 if cut == Committed {
-                    switch(&places, Slot::A, to).unwrap();
+                    switch(&places, if to == Who::Other { Slot::A } else { Slot::B }, to).unwrap();
                 } else {
                     // Materialize the exact on-disk prefix of finish(); resume must reload it from files.
                     s.switching = Some(Switching { to, slot: "_a".into(), saved: false });
                     s.save(&b.state).unwrap();
                     if to == Who::Other {
                         match cut {
-                            SavingBoot | SavedBoot | SavingInit => {
+                            SavingBoot | SavingBootTail | SavedBoot | SavingInit => {
                                 let offset = skyward_block::area::HEADER + store.boot + store.init_boot;
-                                prefix(&b.store, offset, if cut == SavingBoot { &stock_boot[..4096] } else { &stock_boot });
+                                let end = match cut {
+                                    SavingBoot => 4096,
+                                    SavingBootTail => boot_image_len + 4096,
+                                    _ => stock_boot.len(),
+                                };
+                                prefix(&b.store, offset, &stock_boot[..end]);
                                 if cut == SavingInit {
                                     prefix(&b.store, offset + store.boot, &stock_init[..4096]);
                                 }
                             }
-                            SavedPair | SaveRecorded | WritingBoot | WroteBoot | WritingInit | WrotePair => {
+                            SavedPair | SaveRecorded | WritingBoot | WritingBootTail | WroteBoot | WritingInit | WrotePair => {
                                 let saved = store::save(&store, &b.store, 1, &b.dir, Slot::A).unwrap();
                                 if cut != SavedPair {
                                     s.saved = Some(saved);
@@ -334,7 +575,10 @@ mod tests {
                         }
                     }
                     match cut {
-                        WritingBoot => prefix(&b.dir.join("boot_a"), 0, &target.0[..4096]),
+                        WritingBoot | WritingBootTail => {
+                            let end = if cut == WritingBootTail { boot_image_len + 4096 } else { 4096 };
+                            prefix(&b.dir.join("boot_a"), 0, &target.0[..end]);
+                        }
                         WroteBoot | WritingInit => {
                             prefix(&b.dir.join("boot_a"), 0, target.0);
                             if cut == WritingInit {
@@ -353,23 +597,35 @@ mod tests {
                 assert!(!resume(&places).unwrap(), "{case}: resume is not idempotent");
                 let finished = State::load(&b.state).unwrap();
                 let saved = finished.saved.unwrap();
-                assert_eq!((saved.entry, &saved.boot, &saved.init_boot), (1, &old_save.boot, &old_save.init_boot), "{case}: wrong save after resume");
+                assert_eq!((saved.entry, saved.boot.as_str(), saved.init_boot.as_str()), (1, full_boot_sha.as_str(), pinned[1].1), "{case}: wrong save after resume");
                 store::check(&store, &b.store, &old_save).unwrap();
+                let check_control = || {
+                    if gpt_sizes.is_some() {
+                        let seen = store::held(&store, &b.dir, Slot::B).unwrap();
+                        assert_eq!((&seen.boot, &seen.init_boot), (&old_save.boot, &old_save.init_boot), "{case}: control slot bytes changed");
+                        for (name, len, _) in control {
+                            assert_eq!(fs::metadata(b.dir.join(name)).unwrap().len(), len as u64, "{case}: wrong {name} size");
+                        }
+                    } else {
+                        assert_eq!(b.read("boot_b"), vec![0xb1; 8192], "{case}: the other boot slot was written");
+                        assert_eq!(b.read("init_boot_b"), vec![0xb2; 16384], "{case}: the other init_boot slot was written");
+                    }
+                };
                 if to == Who::Other {
                     assert_eq!(finished.occupied.as_deref(), Some("_a"), "{case}");
                     assert!(b.read("boot_a") == guest_boot, "{case}: guest boot differs");
                     assert!(b.read("init_boot_a") == guest_init, "{case}: guest init_boot differs");
                     assert_eq!(b.program_in("init_boot_a"), b"new program", "{case}");
+                    check_control();
                     switch(&places, Slot::B, Who::Installed).unwrap();
                 }
                 let restored = State::load(&b.state).unwrap();
                 assert_eq!((restored.occupied, restored.written, restored.switching), (None, None, None), "{case}");
                 assert!(b.read("boot_a") == stock_boot, "{case}: stock boot not restored byte for byte");
                 assert!(b.read("init_boot_a") == stock_init, "{case}: stock init_boot not restored byte for byte");
-                assert_eq!(b.read("boot_b"), vec![0xb1; 8192], "{case}: the other boot slot was written");
-                assert_eq!(b.read("init_boot_b"), vec![0xb2; 16384], "{case}: the other init_boot slot was written");
+                check_control();
                 assert!(!resume(&places).unwrap(), "{case}: a switch was left pending");
-                println!("{case}: restored both stock images byte for byte");
+                println!("{case}: restored both stock images byte for byte; control slot unchanged");
             }
         }
     }
