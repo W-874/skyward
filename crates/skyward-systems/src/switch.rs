@@ -225,6 +225,39 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local boot.img and init_boot.img fixtures in SKYWARD_DADA_STOCK"]
+    fn dada_stock_pair_survives_interrupted_switch_on_files() {
+        use std::io::Write;
+        let stock = PathBuf::from(std::env::var_os("SKYWARD_DADA_STOCK").expect("stock fixture directory"));
+        let b = installed();
+        let mut s = State::load(&b.state).unwrap();
+        let mut store = s.store.take().unwrap();
+        for (part, size) in [("boot", &mut store.boot), ("init_boot", &mut store.init_boot)] {
+            let src = stock.join(format!("{part}.img"));
+            assert!(src.is_file());
+            *size = std::fs::copy(src, b.dir.join(format!("{part}_a"))).unwrap();
+        }
+        store.area.size = crate::state::Store::size_for(store.boot, store.init_boot);
+        std::fs::File::create(&b.store).unwrap().set_len(store.area.size).unwrap();
+        let init = crate::boot::init_boot(&b.read("init_boot_a"), b"test program", &start()).unwrap();
+        s.system.as_mut().unwrap().set = put(&store, &b.store, OTHER, &mut &[0x5a; 8192][..], 8192, &init).unwrap();
+        s.saved = Some(store::save(&store, &b.store, 0, &b.dir, Slot::A).unwrap());
+        s.store = Some(store);
+        s.switching = Some(Switching { to: Who::Other, slot: "_a".into(), saved: true });
+        s.save(&b.state).unwrap();
+        let mut torn = std::fs::OpenOptions::new().write(true).open(b.dir.join("boot_a")).unwrap();
+        torn.write_all(&[0x5a; 4096]).unwrap();
+        torn.sync_all().unwrap();
+        assert!(resume(&b.places()).unwrap());
+        assert_eq!(b.program_in("init_boot_a"), b"new program");
+        switch(&b.places(), Slot::A, Who::Installed).unwrap();
+        for part in ["boot", "init_boot"] {
+            assert!(b.read(&format!("{part}_a")) == std::fs::read(stock.join(format!("{part}.img"))).unwrap(), "{part} not restored");
+        }
+        assert!(!resume(&b.places()).unwrap());
+    }
+
+    #[test]
     fn switching_there_and_back_puts_each_systems_boot_set_in_place() {
         let b = installed();
         switch(&b.places(), Slot::A, Who::Other).unwrap();
