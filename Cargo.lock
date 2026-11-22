@@ -2476,6 +2476,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "skyward-guest-entry"
+version = "0.3.1"
+dependencies = [
+ "anyhow",
+ "hex",
+ "libc",
+ "serde",
+ "sha2 0.10.9",
+ "skyward-block",
+ "skyward-sys",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "skyward-info"
 version = "0.3.1"
 dependencies = [

@@ -5,13 +5,13 @@ use std::os::unix::fs::symlink;
 use std::process::Command;
 
 const LOG: &[u8] = b"guest boot log\n";
-const STATE: &[u8] = b"2\n";
+const STATE: &[u8] = b"v1\n";
 
 fn guest_tree(root: &Path) -> Result<()> {
     fs::create_dir_all(root.join("volumes/logs/boot"))?;
     fs::create_dir_all(root.join("volumes/state/empty"))?;
     fs::write(root.join("volumes/logs/boot/current"), LOG)?;
-    fs::write(root.join("volumes/state/attempts"), STATE)?;
+    fs::write(root.join("volumes/state/probe-ok"), STATE)?;
     fs::write(root.join("not-a-diagnostic"), b"do not export")?;
     symlink("/etc/passwd", root.join("volumes/logs/link"))?;
     Ok(())
@@ -19,7 +19,7 @@ fn guest_tree(root: &Path) -> Result<()> {
 
 fn verify_files(output: &Path) -> Result<()> {
     ensure!(fs::read(output.join("logs/boot/current"))? == LOG, "nested log did not match");
-    ensure!(fs::read(output.join("state/attempts"))? == STATE, "state did not match");
+    ensure!(fs::read(output.join("state/probe-ok"))? == STATE, "state did not match");
     ensure!(output.join("state/empty").is_dir(), "empty directory was not retained");
     ensure!(fs::symlink_metadata(output.join("logs/link")).is_err(), "guest symlink was copied");
     ensure!(!output.join("not-a-diagnostic").exists(), "unexpected volume was copied");

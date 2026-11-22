@@ -1,0 +1,2 @@
+androidboot.vendor.quoted_array = "first", 'say "hello", "again"', "it's last"
+androidboot.vendor.quoted_scalar = 'vendor says "hello"'

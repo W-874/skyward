@@ -1,0 +1,22 @@
+[package]
+name = "skyward-guest-entry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "guest-entry"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+hex.workspace = true
+libc.workspace = true
+serde.workspace = true
+toml.workspace = true
+skyward-block = { path = "../skyward-block" }
+skyward-sys = { path = "../skyward-sys" }
+tempfile = "3.27.0"
+
+[target.'cfg(target_os = "android")'.dependencies]
+sha2 = "0.10.9"
