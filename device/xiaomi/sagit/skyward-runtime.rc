@@ -1,0 +1,4 @@
+# /tmp is mounted in the recovery init script's on-init action. Keep private
+# runtime files there; /skyward/run in the ramdisk points to this directory.
+on post-fs
+    mkdir /tmp/skyward 0700 root root

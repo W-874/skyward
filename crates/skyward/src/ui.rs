@@ -41,7 +41,7 @@ use skyward_ui::app::{
     INSTALL_UNFINISHED, USB_DRIVE,
 };
 use skyward_ui::settings::Keeper;
-use skyward_ui::surface::kms::KmsSurface;
+use skyward_ui::surface::DeviceSurface;
 use skyward_ui::{Canvas, Fonts, Lang, Surface};
 use skyward_vab::{Merge, Standing};
 use std::collections::{BTreeSet, VecDeque};
@@ -80,7 +80,7 @@ const STORAGE_LOGS: &str = "Skyward/logs";
 const SCREENSHOTS: &str = "DCIM/Screenshots";
 const HELD_SCREENSHOTS: &str = "/skyward/run/screenshots";
 
-/// The panel backlight under /sys/class/backlight.
+/// The panel backlight: a backlight class device or the legacy MDSS LED.
 struct Backlight {
     path: PathBuf,
     /// The raw level at the top of the slider: the panel's normal maximum.
@@ -90,19 +90,23 @@ struct Backlight {
 }
 
 impl Backlight {
-    fn open() -> Result<Self> {
-        let mut dirs: Vec<PathBuf> = fs::read_dir("/sys/class/backlight")
-            .context("read /sys/class/backlight")?
-            .map(|e| e.map(|e| e.path()))
-            .collect::<std::io::Result<_>>()?;
-        dirs.sort();
-        // Qualcomm panels expose panel0-backlight; take it when present.
-        let dir = dirs
-            .iter()
-            .find(|d| d.file_name().is_some_and(|n| n == "panel0-backlight"))
-            .or(dirs.first())
-            .ok_or_else(|| anyhow!("no backlight device"))?
-            .clone();
+    fn open(fbdev: bool) -> Result<Self> {
+        let mdss_led = Path::new("/sys/class/leds/lcd-backlight");
+        let dir = if fbdev && mdss_led.is_dir() {
+            mdss_led.to_owned()
+        } else {
+            let mut dirs: Vec<PathBuf> = fs::read_dir("/sys/class/backlight")
+                .context("read /sys/class/backlight")?
+                .map(|e| e.map(|e| e.path()))
+                .collect::<std::io::Result<_>>()?;
+            dirs.sort();
+            // Qualcomm panels expose panel0-backlight; take it when present.
+            dirs.iter()
+                .find(|d| d.file_name().is_some_and(|n| n == "panel0-backlight"))
+                .or(dirs.first())
+                .ok_or_else(|| anyhow!("no backlight device"))?
+                .clone()
+        };
         let read = |name: &str| -> Result<u32> {
             fs::read_to_string(dir.join(name))
                 .with_context(|| format!("read {}/{name}", dir.display()))?
@@ -110,7 +114,8 @@ impl Backlight {
                 .parse()
                 .with_context(|| format!("parse {name}"))
         };
-        let top = normal_max(read("max_brightness")?)?;
+        let max = read("max_brightness")?;
+        let top = if fbdev { max } else { normal_max(max)? };
         let level = read("brightness")?;
         Ok(Backlight { path: dir.join("brightness"), top, level })
     }
@@ -1117,7 +1122,7 @@ struct Pages<'a> {
     info: skyward_info::DeviceInfo,
     unread: Untaken,
     fonts: Fonts,
-    surface: KmsSurface,
+    surface: DeviceSurface,
     /// The frame last drawn.
     screen: Canvas,
     inputs: Inputs,
@@ -1238,7 +1243,7 @@ impl<'a> Pages<'a> {
         untaken(&mut unread.battery, "the battery", battery.as_ref().err())?;
         let info = skyward_info::collect_with(cfg, battery.unwrap_or_default())?;
         let fonts = Fonts::load(font, 0, mono)?;
-        let mut surface = KmsSurface::open("/dev/dri/card0")?;
+        let mut surface = DeviceSurface::open()?;
         let (w, h) = surface.size();
         // A touch controller that follows the panel wakes as the panel goes
         // from rest to running, and at no other time. The recovery service
@@ -1256,7 +1261,7 @@ impl<'a> Pages<'a> {
         let started = Instant::now();
         let control = Control::open()?;
         let haptics = cfg.haptics.as_ref().map(Haptics::open).transpose()?;
-        let backlight = Backlight::open()?;
+        let backlight = Backlight::open(surface.uses_fbdev())?;
         let first = match &request.work {
             Work::Fastboot => Screen::Fastboot,
             Work::PromptWipeData => Screen::CantStart,

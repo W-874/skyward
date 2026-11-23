@@ -1,18 +1,24 @@
 use crate::canvas::Canvas;
 use anyhow::Result;
 
-/// A present target. The device backend scans out through KMS; the host
-/// preview backend encodes PNGs. Keeping the renderer behind this trait is
-/// what lets the whole UI be built and reviewed without the phone.
+/// A present target. On device this scans out through KMS or fbdev; host
+/// previews encode PNGs. The renderer does not need a device to run.
 pub trait Surface {
     fn size(&self) -> (u32, u32);
-    /// Hand `canvas` to the display. It returns once the frame before it is
-    /// on the panel and this one is on its way, so the next frame is drawn
-    /// while this one goes out.
+    /// Hand `canvas` to the display. The backend may queue the frame for
+    /// scanout while the next one is drawn.
     fn present(&mut self, canvas: &Canvas) -> Result<()>;
     /// Wait until the frame presented last is on the panel.
     fn settle(&mut self) -> Result<()>;
 }
+
+#[cfg(any(target_os = "android", test))]
+mod fbdev;
+
+#[cfg(target_os = "android")]
+mod device;
+#[cfg(target_os = "android")]
+pub use device::DeviceSurface;
 
 /// How Qualcomm's display driver drives a mode, from the text of the
 /// connector's mode_properties blob: key=value lines, a block per mode_name.

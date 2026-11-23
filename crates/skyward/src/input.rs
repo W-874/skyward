@@ -37,14 +37,21 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
 
 const KEYS: [KeyCode; 4] = [KeyCode::KEY_POWER, KeyCode::KEY_VOLUMEUP, KeyCode::KEY_VOLUMEDOWN, KeyCode::KEY_BACK];
 
-fn key_of(code: KeyCode) -> Option<Key> {
-    match code {
-        KeyCode::KEY_POWER => Some(Key::Power),
-        KeyCode::KEY_VOLUMEUP => Some(Key::VolumeUp),
-        KeyCode::KEY_VOLUMEDOWN => Some(Key::VolumeDown),
-        KeyCode::KEY_BACK => Some(Key::Back),
-        _ => None,
-    }
+fn key_event(code: KeyCode, value: i32) -> Option<Event> {
+    // The UI times its own repeats, so ignore the kernel's repeats.
+    let down = match value {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    let key = match code {
+        KeyCode::KEY_POWER => Key::Power,
+        KeyCode::KEY_VOLUMEUP => Key::VolumeUp,
+        KeyCode::KEY_VOLUMEDOWN => Key::VolumeDown,
+        KeyCode::KEY_BACK => Key::Back,
+        _ => return None,
+    };
+    Some(Event::Key(key, down))
 }
 
 /// A device read failed because it was unplugged.
@@ -159,6 +166,8 @@ impl Panel {
                     self.moved = false;
                 }
                 _ if self.dropped => {}
+                // Some panels also report their capacitive keys on this fd.
+                EventSummary::Key(_, code, value) => out.extend(key_event(code, value)),
                 EventSummary::AbsoluteAxis(_, AbsoluteAxisCode::ABS_MT_SLOT, v) => self.slot = v,
                 EventSummary::AbsoluteAxis(_, AbsoluteAxisCode::ABS_MT_TRACKING_ID, v) if self.slot == 0 => self.down = v >= 0,
                 EventSummary::AbsoluteAxis(_, AbsoluteAxisCode::ABS_MT_POSITION_X, v) if self.slot == 0 => {
@@ -306,13 +315,9 @@ impl Inputs {
         for (i, (path, b)) in self.buttons.iter_mut().enumerate() {
             match b.fetch_events() {
                 Ok(events) => {
-                    // The kernel's own repeats of a key held are left out;
-                    // the UI times its own.
                     for e in events {
-                        if let EventSummary::Key(_, code, value @ (0 | 1)) = e.destructure()
-                            && let Some(k) = key_of(code)
-                        {
-                            out.push(Event::Key(k, value == 1));
+                        if let EventSummary::Key(_, code, value) = e.destructure() {
+                            out.extend(key_event(code, value));
                         }
                     }
                 }

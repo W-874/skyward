@@ -199,6 +199,29 @@ at the next start and brings Skyward up before anything else.
 
 ## Building
 
+**Mi 6 (sagit), from source:** From this checkout on a Linux x86-64 AOSP build host, run:
+
+```sh
+JOBS=12 bash device/xiaomi/sagit/build-sagit-recovery.sh
+```
+
+The script builds `skyward` and the static `system-init` with Rust 1.100.0,
+the Android arm64 target, NDK 29.0.14206865 and API 30. It calls Cargo directly;
+no `cargo-ndk` or stock image is needed. The sibling `../uwuAOSP-src` tree must
+contain the sagit board's SkyWard overlay hook and its patched `Image.gz-dtb`.
+The `uwu_sagit-cp2a-userdebug` recovery rules supply the init service, fstab,
+ramdisk, boot header and partition size check. The resulting image is
+`../uwuAOSP-src/out-skyward-sagit/target/product/sagit/recovery.img`; the normal
+AOSP `out/` and this checkout's `target/` are not staging inputs or outputs.
+
+Set `AOSP_TOP` to relocate the Android source, `PINNED_RUST` to relocate the
+toolchain (`bin/rustc`, `bin/cargo` and Android std), or `ANDROID_NDK_HOME` to
+relocate the NDK. The script defaults to the workspace `../tools/rust-1.100.0/`
+toolchain and `${ANDROID_HOME:-$HOME/Android/Sdk}/ndk/29.0.14206865`.
+`SOURCE_DATE_EPOCH` defaults to the SkyWard commit timestamp. No device is used.
+
+**Other devices, with the stock-image packer:**
+
 Skyward builds with the version of Rust that `rust-toolchain.toml` names, with its
 `aarch64-linux-android` target, the Android NDK r29 and
 [cargo-ndk](https://github.com/bbqsrc/cargo-ndk). The recovery service is built for

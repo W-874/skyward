@@ -1,0 +1,17 @@
+# Xiaomi Mi 6. The msm8998-common recovery fstab is supplied by AOSP.
+[device]
+codename = "sagit"
+brand = "Xiaomi"
+model = "Mi 6"
+ab = false
+soc = { en = "Snapdragon 835", hans = "骁龙 835", hant = "驍龍 835" }
+
+[display]
+width = 1080
+height = 1920
+density = 480
+diagonal = 5.15
+
+[modules]
+# This 4.19 kernel carries the MDSS panel and touch drivers built in.
+sources = []

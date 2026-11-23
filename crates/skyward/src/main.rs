@@ -816,7 +816,7 @@ fn recovery() -> Result<()> {
             // erasing them, which may take super with them, and undoing
             // shared blocks, which writes to the slot's own.
             let mut programs = cfg.services.clone();
-            if !matches!(request.work, bcb::Work::Fastboot | bcb::Work::WipeAb { .. } | bcb::Work::UnshareBlocks) {
+            if cfg.device.ab && !matches!(request.work, bcb::Work::Fastboot | bcb::Work::WipeAb { .. } | bcb::Work::UnshareBlocks) {
                 programs.extend(prepare(&cfg, booted_slot()?)?);
             }
             let root = Path::new("/");
