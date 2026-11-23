@@ -208,9 +208,10 @@ JOBS=12 bash device/xiaomi/sagit/build-sagit-recovery.sh
 The script builds `skyward` and the static `system-init` with Rust 1.100.0,
 the Android arm64 target, NDK 29.0.14206865 and API 30. It calls Cargo directly;
 no `cargo-ndk` or stock image is needed. The sibling `../uwuAOSP-src` tree must
-contain the sagit board's SkyWard overlay hook and its patched `Image.gz-dtb`.
-The `uwu_sagit-cp2a-userdebug` recovery rules supply the init service, fstab,
-ramdisk, boot header and partition size check. The resulting image is
+contain the Sagit board's SkyWard overlay hook and the manifest-pinned kernel
+checkout at `kernel/xiaomi/msm8998`. The `uwu_sagit-cp2a-userdebug` recovery
+rules build the kernel and supply the init service, fstab, ramdisk, boot header
+and partition size check. The resulting image is
 `../uwuAOSP-src/out-skyward-sagit/target/product/sagit/recovery.img`; the normal
 AOSP `out/` and this checkout's `target/` are not staging inputs or outputs.
 

@@ -16,7 +16,8 @@ fail() { printf 'sagit: %s\n' "$*" >&2; exit 1; }
 [[ $("$rust/bin/cargo" -V) == 'cargo 1.100.0 '* ]] || fail 'requires pinned Cargo 1.100.0'
 grep -Eq '^Pkg\.Revision[[:space:]]*=[[:space:]]*29\.0\.14206865[[:space:]]*$' "$ndk/source.properties" || fail 'requires NDK r29 (29.0.14206865)'
 cd "$aosp"
-printf '%s  %s\n' 613fa9fe8dd99c6096c6f7da768938e5378afb5caebfce9e840d73cea1f124e0 device/xiaomi/sagit/prebuilt/Image.gz-dtb | sha256sum -c -
+[[ -f kernel/xiaomi/msm8998/arch/arm64/configs/vendor/xiaomi/sagit.config ]] ||
+    fail 'sync kernel/xiaomi/msm8998 from the Sagit kernel manifest first'
 
 # Fixed relative OUT_DIR is also checked in sagit/BoardConfig.mk. Never share
 # a target/product/sagit staging tree or Ninja graph with the normal product.
